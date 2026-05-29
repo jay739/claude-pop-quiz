@@ -1,0 +1,18 @@
+# Never commit local Claude Code settings — they often contain secrets
+# (API keys, SSH passwords, host IPs) in permissions/env.
+settings.local.json
+**/settings.local.json
+
+# Runtime state produced by the hook
+state/
+**/pop_quiz_state.json
+*.tmp
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor / OS cruft
+.DS_Store
+.vscode/
+.idea/

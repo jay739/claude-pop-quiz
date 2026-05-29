@@ -1,0 +1,26 @@
+{
+  "_comment": "Merge the 'hooks' block below into your ~/.claude/settings.json (user scope = every project) or a project's .claude/settings.json. Do NOT paste your permissions/secrets here. The install.sh script does this merge for you.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/hooks/pop_quiz.py prompt 2>/dev/null || true",
+            "statusMessage": "pop-quiz cadence..."
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/hooks/pop_quiz.py tool 2>/dev/null || true"
+          }
+        ]
+      }
+    ]
+  }
+}
