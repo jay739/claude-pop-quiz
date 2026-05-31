@@ -48,44 +48,90 @@ Prefer to wire it by hand? Copy the `hooks` block from
 
 ## Configuration
 
-All optional, via environment variables:
+**Everything is optional and tweakable** — the hook ships with sane defaults and
+nothing is hard-coded into the script. Every knob is an environment variable:
 
-| Variable | Default | Meaning |
+| Variable | Default | What it does |
 |---|---|---|
-| `POP_QUIZ_MIN` | `40` | Lower bound of the random action threshold |
+| `POP_QUIZ_MIN` | `40` | Lower bound of the random action threshold (how *often* it fires) |
 | `POP_QUIZ_MAX` | `45` | Upper bound of the random action threshold |
 | `POP_QUIZ_QUESTIONS` | `5` | Number of questions per check |
 | `POP_QUIZ_FORMAT` | `essay` | `essay`, `mcq`, or `mixed` — see [Quiz format](#quiz-format--cant-i-just-skip-it) |
-| `POP_QUIZ_JOURNAL` | `<claude-dir>/state/learning_journal.md` | Path to the markdown learning journal |
+| `POP_QUIZ_DEFER_LIMIT` | `0` | Consecutive defers (across all chats) before tool use **freezes**; `0` = soft mode, never freeze |
+| `POP_QUIZ_JOURNAL` | `<claude-dir>/state/learning_journal.md` | Where the graded journal is written |
 
-The 40–45 default is tuned for typical chat lengths; raise it for longer sessions.
-By default the journal lives under `state/` (gitignored — it's personal data); set
-`POP_QUIZ_JOURNAL` to a tracked path if you want to version or back it up.
-Example — quiz less often with 3 questions, journal into a repo:
+### How to set / change them
 
-```json
-"command": "POP_QUIZ_MIN=90 POP_QUIZ_MAX=110 POP_QUIZ_QUESTIONS=3 POP_QUIZ_JOURNAL=$HOME/notes/learning_journal.md python3 ~/.claude/hooks/pop_quiz.py prompt 2>/dev/null || true"
-```
+These values get **baked into the hook command** in your `~/.claude/settings.json`.
+Two ways to change them — both safe to repeat:
+
+1. **Re-run the installer with env vars** (it rewrites the command for you):
+   ```bash
+   POP_QUIZ_FORMAT=mcq POP_QUIZ_DEFER_LIMIT=3 ./install.sh
+   ```
+   Run with no env and it also **prompts** you for format + defer limit.
+
+2. **Edit the command directly** in `~/.claude/settings.json` — prepend the vars
+   to *both* the `UserPromptSubmit` and `PreToolUse` commands (the freeze needs
+   `POP_QUIZ_DEFER_LIMIT` on both):
+   ```json
+   "command": "POP_QUIZ_MIN=90 POP_QUIZ_MAX=110 POP_QUIZ_QUESTIONS=3 POP_QUIZ_FORMAT=mcq POP_QUIZ_DEFER_LIMIT=3 POP_QUIZ_JOURNAL=$HOME/notes/learning_journal.md python3 ~/.claude/hooks/pop_quiz.py prompt 2>/dev/null || true"
+   ```
+
+Changes take effect on **new chats** (or after `/hooks`). Common tweaks:
+
+- **Quiz less often:** raise `POP_QUIZ_MIN` / `POP_QUIZ_MAX` (e.g. `90`/`110`).
+- **Go fast:** `POP_QUIZ_FORMAT=mcq` — one-line answers.
+- **Force discipline:** `POP_QUIZ_DEFER_LIMIT=3` — freeze after 3 skips.
+- **Back up your journal:** point `POP_QUIZ_JOURNAL` at a tracked path. By default
+  it's under `state/` (gitignored — personal data).
+- **Turn it off entirely:** remove the hook block from `settings.json`, or comment
+  the command.
 
 ## Quiz format & "can't I just skip it?"
 
-A hook injects *instructions*, not a hard lock — Claude can't physically force you
-to answer, and a determined user can always say "skip." So instead of fighting that,
-the design **removes the reason to skip**: the usual excuse is "I don't have time to
-write essays," so there's a fast path.
+### Format: pick your friction
 
 | `POP_QUIZ_FORMAT` | What you get |
 |---|---|
-| `essay` *(default)* | Free-response answers in your own words. If you're short on time or try to bail, Claude offers the **MCQ quick version** of the *same* questions instead of letting you skip outright. |
+| `essay` *(default)* | Free-response answers in your own words. If you're short on time, Claude offers the **MCQ quick version** of the *same* questions. |
 | `mcq` | Every question is **multiple choice** (A–D, one correct). You answer in a single line of letters — e.g. `1C 2A 3D 4B 5A`. Seconds, no typing. |
 | `mixed` | Half free-response, half multiple choice. |
 
-Either way you still get graded, corrected, and **journaled** — so a 15-second MCQ
-round is real revision, not a bypass. Set it globally, e.g.:
+Either way you're graded, corrected, and **journaled** — a 15-second MCQ round is
+real revision, not a bypass.
+
+### Defer & the hard stop
+
+When a quiz fires you can **defer** — say "defer" / "skip quiz", or just keep
+working. But defers are counted **globally, across every chat** (opening a fresh
+chat doesn't reset them). Once you hit `POP_QUIZ_DEFER_LIMIT`, the `PreToolUse`
+hook **denies every tool call** — Claude can talk but can't edit, run, or search
+anything until you answer a quiz. Submitting an answer (the hook recognizes the
+one-line `1C 2A 3D 4B 5A` shape) resets the counter and unlocks.
 
 ```json
-"command": "POP_QUIZ_FORMAT=mcq python3 ~/.claude/hooks/pop_quiz.py prompt 2>/dev/null || true"
+"command": "POP_QUIZ_FORMAT=mcq POP_QUIZ_DEFER_LIMIT=3 python3 ~/.claude/hooks/pop_quiz.py prompt 2>/dev/null || true"
 ```
+
+### Honest about the limits
+
+This is a **discipline gate, not a vault.** Two things no hook can do:
+
+1. **Judge understanding.** The hook checks an answer's *shape*, not its
+   correctness — only the model grades that, and the model is cooperative, so it
+   can be talked past. The hard stop forces you to *submit an attempt*, not to
+   pass.
+2. **Defend against its owner.** It's your `settings.json` and your script — one
+   commented line disables it. It exists to stop *drift*, not a determined you.
+
+The real lever is making the quiz cheap (MCQ = seconds) so answering beats
+dodging. The freeze is the backstop for when you'd otherwise let it slide.
+
+> **Live per-question timer?** Not possible in Claude Code — it's turn-based, and
+> nothing runs during your think-time to enforce a countdown or auto-skip. The
+> hook *can* read the clock and log how long you took, and a non-answer counts as
+> a defer, but there's no live 15-second timer.
 
 ## Portability / cross-device
 
