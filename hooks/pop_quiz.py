@@ -23,13 +23,15 @@ Configuration (environment variables, all optional):
   POP_QUIZ_MIN        lower bound of the random threshold (default 40)
   POP_QUIZ_MAX        upper bound of the random threshold (default 45)
   POP_QUIZ_QUESTIONS  number of questions to ask           (default 5)
+  POP_QUIZ_FORMAT     essay | mcq | mixed                  (default essay)
+                      essay = free response; mcq = one-line A-D multiple
+                      choice (seconds, no typing); mixed = half and half.
   POP_QUIZ_JOURNAL    path to the journal markdown file
                       (default <claude-dir>/state/learning_journal.md)
 
-State is stored next to this script under <claude-dir>/state/, so the whole
-~/.claude/ folder can be copied to another machine and it just works.
-
-License: MIT.
+Everything is self-contained: state AND the default journal live under
+<claude-dir>/state/, so copying ~/.claude/ to another machine just works —
+no absolute paths baked in. License: MIT.
 """
 import json
 import os
@@ -56,8 +58,39 @@ NUM_Q = _int_env("POP_QUIZ_QUESTIONS", 5)
 if MIN_GAP > MAX_GAP:
     MIN_GAP, MAX_GAP = MAX_GAP, MIN_GAP
 
+FORMAT = (os.environ.get("POP_QUIZ_FORMAT") or "essay").lower()
+if FORMAT not in ("essay", "mcq", "mixed"):
+    FORMAT = "essay"
+
+# Portable default: lives under <claude-dir>/state/ so it travels with ~/.claude.
+# Override with POP_QUIZ_JOURNAL to point at a tracked/backed-up path.
 JOURNAL = os.environ.get("POP_QUIZ_JOURNAL") \
     or os.path.join(STATE_DIR, "learning_journal.md")
+
+
+def _format_clause():
+    """How the questions should be presented — the anti-bypass lever. The MCQ
+    path makes answering a few seconds of tapping letters, so 'no time' is never
+    a reason to skip."""
+    if FORMAT == "mcq":
+        return (
+            f"Present all {NUM_Q} questions as MULTIPLE CHOICE: each with exactly "
+            "4 options labelled A-D, exactly one correct, the wrong options "
+            "plausible (not throwaways). The user answers in ONE line of letters "
+            "(e.g. \"1C 2A 3D 4B 5A\") — it takes seconds, no essays. "
+        )
+    if FORMAT == "mixed":
+        return (
+            f"Ask the first half of the {NUM_Q} questions as short free-response "
+            "and the rest as MULTIPLE CHOICE (4 plausible options A-D, one "
+            "correct) that the user answers with single letters. "
+        )
+    return (
+        "Make the user answer in their own words. If they are short on time or "
+        "try to skip, do NOT let them bail entirely — offer the quick version "
+        "instead: re-ask the SAME questions as MULTIPLE CHOICE (4 options A-D "
+        "each, one correct) that they answer in a single line of letters. "
+    )
 
 
 def directive(count):
@@ -70,17 +103,18 @@ def directive(count):
         "used, (b) the scripts or code written/changed and WHY they work that way, "
         "and (c) the project files touched and what each does. Aim the questions at "
         "the meatiest concepts that appeared, NOT at conversational trivia (don't "
-        "quiz on what was asked or in what order). Make the user answer in their "
-        "own words — do not answer for them. After they respond, give brief "
-        "feedback, correct mistakes, and flag real gaps to study. Then resume what "
-        "they were doing. Tell the user this check fired automatically and is a "
-        "mandatory part of their learning loop. FINALLY, after grading, append the "
-        f"results to the learning journal at {JOURNAL} (create it with a short "
-        "header if it does not exist): add a section dated today with a one-line "
-        "topic summary, and for EACH question a bullet containing the question, the "
-        "user's answer in their own words (brief), the correct answer, a verdict "
-        "(correct / partial / missed), and 1-2 study links on the topic. Newest "
-        "entry first. Keep it concise — it is the user's personal revision log."
+        "quiz on what was asked or in what order). "
+        + _format_clause() +
+        "After they respond, give brief feedback, correct mistakes, and flag real "
+        "gaps to study. Then resume what they were doing. Tell the user this check "
+        "fired automatically and is a mandatory part of their learning loop. "
+        "FINALLY, after grading, append the results to the learning journal at "
+        f"{JOURNAL} (create it with a short header if it does not exist): add a "
+        "section dated today with a one-line topic summary, and for EACH question "
+        "a bullet with the question, the user's answer in brief, the correct "
+        "answer, a verdict (correct / partial / missed), and 1-2 study links on "
+        "the topic. Newest entry first. Keep it concise — it is the user's "
+        "personal revision log."
     )
 
 

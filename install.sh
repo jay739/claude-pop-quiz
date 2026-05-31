@@ -54,5 +54,8 @@ PY
 echo
 echo "Done. Open /hooks in Claude Code once (or restart) to load the new config."
 echo "New chats pick it up automatically. Default cadence is every 40-45 actions."
-echo "Tune it with env vars, e.g. for longer sessions:"
-echo "  POP_QUIZ_MIN=90 POP_QUIZ_MAX=110 POP_QUIZ_QUESTIONS=5"
+echo "Graded results are journaled to: $CLAUDE_DIR/state/learning_journal.md"
+echo "  (override with POP_QUIZ_JOURNAL=/path/to/journal.md)"
+echo "Tune it with env vars, e.g.:"
+echo "  POP_QUIZ_MIN=90 POP_QUIZ_MAX=110 POP_QUIZ_QUESTIONS=5   # quiz less often"
+echo "  POP_QUIZ_FORMAT=mcq                                     # fast multiple-choice"

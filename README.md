@@ -55,6 +55,7 @@ All optional, via environment variables:
 | `POP_QUIZ_MIN` | `40` | Lower bound of the random action threshold |
 | `POP_QUIZ_MAX` | `45` | Upper bound of the random action threshold |
 | `POP_QUIZ_QUESTIONS` | `5` | Number of questions per check |
+| `POP_QUIZ_FORMAT` | `essay` | `essay`, `mcq`, or `mixed` — see [Quiz format](#quiz-format--cant-i-just-skip-it) |
 | `POP_QUIZ_JOURNAL` | `<claude-dir>/state/learning_journal.md` | Path to the markdown learning journal |
 
 The 40–45 default is tuned for typical chat lengths; raise it for longer sessions.
@@ -66,12 +67,41 @@ Example — quiz less often with 3 questions, journal into a repo:
 "command": "POP_QUIZ_MIN=90 POP_QUIZ_MAX=110 POP_QUIZ_QUESTIONS=3 POP_QUIZ_JOURNAL=$HOME/notes/learning_journal.md python3 ~/.claude/hooks/pop_quiz.py prompt 2>/dev/null || true"
 ```
 
-## A note on cross-device / account sync
+## Quiz format & "can't I just skip it?"
+
+A hook injects *instructions*, not a hard lock — Claude can't physically force you
+to answer, and a determined user can always say "skip." So instead of fighting that,
+the design **removes the reason to skip**: the usual excuse is "I don't have time to
+write essays," so there's a fast path.
+
+| `POP_QUIZ_FORMAT` | What you get |
+|---|---|
+| `essay` *(default)* | Free-response answers in your own words. If you're short on time or try to bail, Claude offers the **MCQ quick version** of the *same* questions instead of letting you skip outright. |
+| `mcq` | Every question is **multiple choice** (A–D, one correct). You answer in a single line of letters — e.g. `1C 2A 3D 4B 5A`. Seconds, no typing. |
+| `mixed` | Half free-response, half multiple choice. |
+
+Either way you still get graded, corrected, and **journaled** — so a 15-second MCQ
+round is real revision, not a bypass. Set it globally, e.g.:
+
+```json
+"command": "POP_QUIZ_FORMAT=mcq python3 ~/.claude/hooks/pop_quiz.py prompt 2>/dev/null || true"
+```
+
+## Portability / cross-device
 
 Claude Code stores settings, hooks, and state on the **local filesystem** — none of
-it syncs through your Claude account. To use this on multiple machines, replicate
-`~/.claude/hooks/pop_quiz.py` and the hook block in `~/.claude/settings.json` to each
-device (e.g. via this repo + `./install.sh`, or your dotfiles).
+it syncs through your Claude account. This hook is built to travel: **no absolute
+paths are baked in.** Both the counter state and the default journal live under
+`<claude-dir>/state/`, so you have two clean options:
+
+- **Copy `~/.claude/` to the new machine** — hooks, state, and journal come with it
+  and just work.
+- **Clone this repo + run `./install.sh`** on each device — installs the hook and
+  merges the config. The journal defaults to `<claude-dir>/state/learning_journal.md`
+  there; set `POP_QUIZ_JOURNAL` if you want it somewhere tracked/backed-up.
+
+Because the default is relative to `<claude-dir>`, the same hook works on every
+machine with zero edits.
 
 ## Related / prior art
 
