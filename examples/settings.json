@@ -1,5 +1,5 @@
 {
-  "_comment": "Merge the 'hooks' block below into your ~/.claude/settings.json (user scope = every project) or a project's .claude/settings.json. Do NOT paste your permissions/secrets here. The install.sh script does this merge for you.",
+  "_comment": "Merge the 'hooks' block below into your ~/.claude/settings.json (user scope = every project) or a project's .claude/settings.json. Do NOT paste your permissions/secrets here. The install.sh script does this merge for you. Optional: prefix the 'prompt' command with env vars to tune cadence/journal, e.g. POP_QUIZ_MIN=90 POP_QUIZ_MAX=110 POP_QUIZ_JOURNAL=$HOME/notes/learning_journal.md",
   "hooks": {
     "UserPromptSubmit": [
       {

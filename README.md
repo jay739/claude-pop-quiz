@@ -6,6 +6,8 @@ Agentic coding lets you ship work without reading what the agent wrote. The risk
 
 Every ~40–45 *actions* in a chat (your messages **plus** every tool/file/agent call Claude makes), it pauses and makes you answer 5 questions about the technical substance of that session — the jargon used, the code written and *why*, and the files touched. You answer in your own words; Claude grades you and flags gaps.
 
+After grading, Claude appends the results to a **learning journal** — a markdown revision log of every quiz: each question, your answer, the correct answer, a ✅/🟡/❌ verdict, and links to study. Re-read it later, or point it at a git repo to version your progress. See [`JOURNAL.example.md`](JOURNAL.example.md) for the format. Your real journal is personal — it's gitignored by default.
+
 ## How it works
 
 It's two hooks pointing at one script, wired in your Claude Code `settings.json`:
@@ -53,12 +55,15 @@ All optional, via environment variables:
 | `POP_QUIZ_MIN` | `40` | Lower bound of the random action threshold |
 | `POP_QUIZ_MAX` | `45` | Upper bound of the random action threshold |
 | `POP_QUIZ_QUESTIONS` | `5` | Number of questions per check |
+| `POP_QUIZ_JOURNAL` | `<claude-dir>/state/learning_journal.md` | Path to the markdown learning journal |
 
 The 40–45 default is tuned for typical chat lengths; raise it for longer sessions.
-Example — quiz less often, with 3 questions:
+By default the journal lives under `state/` (gitignored — it's personal data); set
+`POP_QUIZ_JOURNAL` to a tracked path if you want to version or back it up.
+Example — quiz less often with 3 questions, journal into a repo:
 
 ```json
-"command": "POP_QUIZ_MIN=90 POP_QUIZ_MAX=110 POP_QUIZ_QUESTIONS=3 python3 ~/.claude/hooks/pop_quiz.py prompt 2>/dev/null || true"
+"command": "POP_QUIZ_MIN=90 POP_QUIZ_MAX=110 POP_QUIZ_QUESTIONS=3 POP_QUIZ_JOURNAL=$HOME/notes/learning_journal.md python3 ~/.claude/hooks/pop_quiz.py prompt 2>/dev/null || true"
 ```
 
 ## A note on cross-device / account sync

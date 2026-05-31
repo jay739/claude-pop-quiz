@@ -15,10 +15,16 @@ tool/file/agent calls. Wired to two events with a mode argument:
 Why count tool calls too? An agentic chat can do a lot of work across very few
 typed messages. Counting only messages would let that work go unexamined.
 
+After grading, Claude appends the results (each question, your answer, the
+correct answer, a verdict, and study links) to a markdown learning journal —
+a running revision log you can re-read or push to git.
+
 Configuration (environment variables, all optional):
   POP_QUIZ_MIN        lower bound of the random threshold (default 40)
   POP_QUIZ_MAX        upper bound of the random threshold (default 45)
   POP_QUIZ_QUESTIONS  number of questions to ask           (default 5)
+  POP_QUIZ_JOURNAL    path to the journal markdown file
+                      (default <claude-dir>/state/learning_journal.md)
 
 State is stored next to this script under <claude-dir>/state/, so the whole
 ~/.claude/ folder can be copied to another machine and it just works.
@@ -50,6 +56,9 @@ NUM_Q = _int_env("POP_QUIZ_QUESTIONS", 5)
 if MIN_GAP > MAX_GAP:
     MIN_GAP, MAX_GAP = MAX_GAP, MIN_GAP
 
+JOURNAL = os.environ.get("POP_QUIZ_JOURNAL") \
+    or os.path.join(STATE_DIR, "learning_journal.md")
+
 
 def directive(count):
     return (
@@ -65,7 +74,13 @@ def directive(count):
         "own words — do not answer for them. After they respond, give brief "
         "feedback, correct mistakes, and flag real gaps to study. Then resume what "
         "they were doing. Tell the user this check fired automatically and is a "
-        "mandatory part of their learning loop."
+        "mandatory part of their learning loop. FINALLY, after grading, append the "
+        f"results to the learning journal at {JOURNAL} (create it with a short "
+        "header if it does not exist): add a section dated today with a one-line "
+        "topic summary, and for EACH question a bullet containing the question, the "
+        "user's answer in their own words (brief), the correct answer, a verdict "
+        "(correct / partial / missed), and 1-2 study links on the topic. Newest "
+        "entry first. Keep it concise — it is the user's personal revision log."
     )
 
 

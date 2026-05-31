@@ -8,6 +8,11 @@ state/
 **/pop_quiz_state.json
 *.tmp
 
+# Personal learning journal (your real answers) — keep private.
+# The committed JOURNAL.example.md shows the format; your real log stays local.
+JOURNAL.md
+learning_journal.md
+
 # Python
 __pycache__/
 *.pyc
