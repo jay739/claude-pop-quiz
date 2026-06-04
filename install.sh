@@ -20,13 +20,16 @@ echo "Installed hook -> $HOOK_DST"
 # answer the prompts when run interactively.
 POP_QUIZ_FORMAT="${POP_QUIZ_FORMAT:-essay}"
 POP_QUIZ_DEFER_LIMIT="${POP_QUIZ_DEFER_LIMIT:-0}"
+POP_QUIZ_JOURNAL_MAX_ENTRIES="${POP_QUIZ_JOURNAL_MAX_ENTRIES:-0}"
 if [ -t 0 ]; then
   read -r -p "Quiz format essay|mcq|mixed [$POP_QUIZ_FORMAT]: " _f || true
   POP_QUIZ_FORMAT="${_f:-$POP_QUIZ_FORMAT}"
   read -r -p "Defer limit before tools freeze, 0=off [$POP_QUIZ_DEFER_LIMIT]: " _d || true
   POP_QUIZ_DEFER_LIMIT="${_d:-$POP_QUIZ_DEFER_LIMIT}"
+  read -r -p "Max journal entries to keep, 0=unlimited [$POP_QUIZ_JOURNAL_MAX_ENTRIES]: " _m || true
+  POP_QUIZ_JOURNAL_MAX_ENTRIES="${_m:-$POP_QUIZ_JOURNAL_MAX_ENTRIES}"
 fi
-export POP_QUIZ_FORMAT POP_QUIZ_DEFER_LIMIT
+export POP_QUIZ_FORMAT POP_QUIZ_DEFER_LIMIT POP_QUIZ_JOURNAL_MAX_ENTRIES
 
 python3 - "$SETTINGS" <<'PY'
 import json, os, sys
@@ -46,11 +49,14 @@ _defer = os.environ.get("POP_QUIZ_DEFER_LIMIT", "0")
 def ensure(event, mode):
     # Both commands get the same config: the tool-mode hook needs
     # POP_QUIZ_DEFER_LIMIT to know whether to freeze, not just the prompt hook.
+    _max = os.environ.get("POP_QUIZ_JOURNAL_MAX_ENTRIES", "0")
     envs = []
     if _fmt and _fmt != "essay":
         envs.append(f"POP_QUIZ_FORMAT={_fmt}")
     if _defer and _defer != "0":
         envs.append(f"POP_QUIZ_DEFER_LIMIT={_defer}")
+    if _max and _max != "0":
+        envs.append(f"POP_QUIZ_JOURNAL_MAX_ENTRIES={_max}")
     prefix = (" ".join(envs) + " ") if envs else ""
     cmd = f"{prefix}python3 ~/.claude/hooks/pop_quiz.py {mode} 2>/dev/null || true"
     arr = hooks.setdefault(event, [])
@@ -80,7 +86,11 @@ echo "Done. Open /hooks in Claude Code once (or restart) to load the new config.
 echo "New chats pick it up automatically. Default cadence is every 40-45 actions."
 echo "Graded results are journaled to: $CLAUDE_DIR/state/learning_journal.md"
 echo "  (override with POP_QUIZ_JOURNAL=/path/to/journal.md)"
-echo "Format: $POP_QUIZ_FORMAT   |   Defer limit (freeze): $POP_QUIZ_DEFER_LIMIT (0=off)"
+echo "Format: $POP_QUIZ_FORMAT   |   Defer limit: $POP_QUIZ_DEFER_LIMIT (0=off)   |   Max journal entries: $POP_QUIZ_JOURNAL_MAX_ENTRIES (0=unlimited)"
 echo "Re-run with env to change, e.g.:"
-echo "  POP_QUIZ_FORMAT=mcq POP_QUIZ_DEFER_LIMIT=3 ./install.sh   # quick MCQ + freeze after 3 defers"
-echo "  POP_QUIZ_MIN=90 POP_QUIZ_MAX=110 POP_QUIZ_QUESTIONS=5     # quiz less often"
+echo "  POP_QUIZ_FORMAT=mcq POP_QUIZ_DEFER_LIMIT=3 ./install.sh          # quick MCQ + freeze after 3 defers"
+echo "  POP_QUIZ_MIN=90 POP_QUIZ_MAX=110 POP_QUIZ_QUESTIONS=5            # quiz less often"
+echo "  POP_QUIZ_JOURNAL_MAX_ENTRIES=100 ./install.sh                    # keep last 100 sessions"
+echo
+echo "To inspect state at any time: python3 ~/.claude/hooks/pop_quiz.py status"
+echo "To remove: ./uninstall.sh"

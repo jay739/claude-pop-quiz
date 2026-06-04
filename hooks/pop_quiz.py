@@ -9,9 +9,11 @@ agent calls. Wired to two events with a mode argument:
     its randomized threshold, inject a directive telling Claude to PAUSE and quiz
     the user. Also resolves a pending quiz (was the user's message an answer or a
     defer?) and enforces the defer limit.
-  - "tool"   (PreToolUse, all tools): increment the counter SILENTLY; and if the
-    learning check is LOCKED (defer limit hit), DENY the tool call so no work
-    proceeds until the user takes the quiz.
+  - "tool"   (PreToolUse, all tools): increment the counter SILENTLY, collect the
+    tool name and any file paths for context enrichment, and if the learning check
+    is LOCKED (defer limit hit), DENY the tool call so no work proceeds until the
+    user takes the quiz.
+  - "status" (CLI only): pretty-print current state, counters, and stats.
 
 Why count tool calls too? An agentic chat can do a lot across few typed
 messages; counting only messages would let that work go unexamined.
@@ -28,20 +30,29 @@ once you've deferred POP_QUIZ_DEFER_LIMIT times, tool use is frozen until you
 submit a quiz answer.
 
 Configuration (environment variables, all optional):
-  POP_QUIZ_MIN          lower bound of the random threshold  (default 40)
-  POP_QUIZ_MAX          upper bound of the random threshold  (default 45)
-  POP_QUIZ_QUESTIONS    number of questions to ask           (default 5)
-  POP_QUIZ_FORMAT       essay | mcq | mixed                  (default essay)
-  POP_QUIZ_DEFER_LIMIT  consecutive defers before tools FREEZE; 0 = never
-                        freeze (soft mode)                   (default 0)
-  POP_QUIZ_JOURNAL      journal markdown path
-                        (default <claude-dir>/state/learning_journal.md)
+  POP_QUIZ_MIN               lower bound of the random threshold  (default 40)
+  POP_QUIZ_MAX               upper bound of the random threshold  (default 45)
+  POP_QUIZ_QUESTIONS         number of questions to ask           (default 5)
+  POP_QUIZ_FORMAT            essay | mcq | mixed                  (default essay)
+  POP_QUIZ_DEFER_LIMIT       consecutive defers before tools FREEZE; 0 = never
+                             freeze (soft mode)                   (default 0)
+  POP_QUIZ_JOURNAL           journal markdown path
+                             (default <claude-dir>/state/learning_journal.md)
+  POP_QUIZ_JOURNAL_MAX_ENTRIES  keep at most this many dated entries in the
+                             journal; 0 = unlimited               (default 0)
 
 Portable: state AND the default journal live under <claude-dir>/state/, so
 copying ~/.claude/ to another machine just works — no absolute paths baked in.
 Defers are tracked GLOBALLY (across chats), so a new chat can't dodge the limit.
+
+Per-project topics: place a .pop-quiz-topics file in the project root (one topic
+per line, lines starting with # are comments). The hook walks up from cwd to ~
+and injects any found topics into the quiz directive for targeted questions.
+
 License: MIT.
 """
+import contextlib
+import fcntl
 import json
 import os
 import random
@@ -52,6 +63,7 @@ import time
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # e.g. ~/.claude
 STATE_DIR = os.path.join(BASE, "state")
 STATE_FILE = os.path.join(STATE_DIR, "pop_quiz_state.json")
+LOCK_FILE = STATE_FILE + ".lock"
 PRUNE_AFTER = 30 * 24 * 3600  # forget sessions untouched for 30 days
 GLOBAL_KEY = "_global"        # holds the cross-chat defer counter + lock flag
 
@@ -66,7 +78,9 @@ def _int_env(name, default):
 MIN_GAP = _int_env("POP_QUIZ_MIN", 40)
 MAX_GAP = _int_env("POP_QUIZ_MAX", 45)
 NUM_Q = _int_env("POP_QUIZ_QUESTIONS", 5)
-DEFER_LIMIT = _int_env("POP_QUIZ_DEFER_LIMIT", 0)  # 0 = soft mode, never freezes
+DEFER_LIMIT = _int_env("POP_QUIZ_DEFER_LIMIT", 0)   # 0 = soft mode, never freezes
+JOURNAL_MAX = _int_env("POP_QUIZ_JOURNAL_MAX_ENTRIES", 0)  # 0 = unlimited
+
 if MIN_GAP > MAX_GAP:
     MIN_GAP, MAX_GAP = MAX_GAP, MIN_GAP
 
@@ -78,21 +92,43 @@ if FORMAT not in ("essay", "mcq", "mixed"):
 JOURNAL = os.environ.get("POP_QUIZ_JOURNAL") \
     or os.path.join(STATE_DIR, "learning_journal.md")
 
-# --- classifying the user's reply to a pending quiz --------------------------
-# "1C 2A 3D 4B 5A" / "1) c, 2) a ..." → an MCQ answer. We require a majority of
-# question-letter pairs so ordinary prose never trips it.
+
+# --- answer classification ---------------------------------------------------
+
+# "1C 2A 3D 4B 5A" / "1) c, 2) a ..." → an MCQ answer.
 _MCQ_PAIR = re.compile(r"\b(\d+)\s*[)\.:\-]?\s*([A-Da-d])\b")
+
 _DEFER_WORDS = {"defer", "defer quiz", "skip", "skip quiz", "quiz later",
                 "later", "not now", "skip the quiz"}
 
+# Messages that start with these words are work instructions, not quiz answers,
+# even if they happen to be long or contain periods.
+_ACTION_START = re.compile(
+    r"^(run|let'?s|let me|okay|ok|can you|could you|please|go ahead|now|next|"
+    r"start|begin|continue|add|create|update|fix|make|change|refactor|"
+    r"write|build|deploy|install|remove|delete|check|show|tell|explain|"
+    r"what|how|why|when|where|yes|no|yep|nope|sure|alright|great|thanks|"
+    r"thank|i want|i need|i'?d like|also|and|but|so|actually|hmm|hm|"
+    r"sounds|looks|seems|that'?s|this|those|these)\b",
+    re.IGNORECASE,
+)
+
 
 def looks_like_mcq_answer(msg):
-    need = max(2, NUM_Q // 2 + 1)
+    # Require a majority of question-number/letter pairs so ordinary prose
+    # never trips it. Use max(1, ...) so a single-question quiz (NUM_Q=1)
+    # can still be satisfied — the original max(2, ...) made it impossible.
+    need = max(1, NUM_Q // 2 + 1)
     return len(_MCQ_PAIR.findall(msg or "")) >= need
 
 
 def looks_like_essay_answer(msg):
     t = (msg or "").strip()
+    if not t:
+        return False
+    # Reject work instructions that are long or punctuated.
+    if _ACTION_START.match(t):
+        return False
     return len(t) >= 80 or t.count(".") >= 2
 
 
@@ -111,7 +147,45 @@ def classify(msg):
     return "defer"  # mcq mode, or a short/off-topic message → treat as a defer
 
 
-# --- directives Claude receives ---------------------------------------------
+# --- per-project topic hints -------------------------------------------------
+
+def _project_topics():
+    """Walk up from cwd to ~ looking for .pop-quiz-topics (one topic per line)."""
+    d = os.getcwd()
+    home = os.path.expanduser("~")
+    for _ in range(12):
+        path = os.path.join(d, ".pop-quiz-topics")
+        if os.path.isfile(path):
+            try:
+                with open(path) as f:
+                    return [ln.strip() for ln in f
+                            if ln.strip() and not ln.startswith("#")]
+            except Exception:
+                return []
+        parent = os.path.dirname(d)
+        if d == home or parent == d:
+            break
+        d = parent
+    return []
+
+
+# --- tools-seen summary for context enrichment -------------------------------
+
+def _tools_summary(sess):
+    seen = sess.get("tools_seen") or {}
+    if not seen:
+        return ""
+    parts = []
+    for tool, files in sorted(seen.items()):
+        if files:
+            parts.append(f"{tool}({', '.join(files[:5])})")
+        else:
+            parts.append(tool)
+    return "Tools used this session: " + ", ".join(parts) + ". "
+
+
+# --- directives Claude receives ----------------------------------------------
+
 def _format_clause():
     if FORMAT == "mcq":
         return (f"Present all {NUM_Q} questions as MULTIPLE CHOICE: 4 options "
@@ -127,7 +201,7 @@ def _format_clause():
             "(A-D, one-line letters). ")
 
 
-def quiz_directive(count, defers):
+def quiz_directive(count, defers, sess):
     pressure = ""
     if DEFER_LIMIT:
         left = max(0, DEFER_LIMIT - defers)
@@ -135,6 +209,10 @@ def quiz_directive(count, defers):
                     f"working), but defers are tracked across all chats: {defers} "
                     f"used, {left} left before ALL tool use freezes until they "
                     f"take a quiz. Mention this if they try to skip. ")
+    tools_hint = _tools_summary(sess)
+    topics = _project_topics()
+    topic_hint = (f"Project-specific topics to prioritise: "
+                  f"{', '.join(topics[:10])}. ") if topics else ""
     return (
         f"MANDATORY {NUM_Q}-QUESTION LEARNING CHECK (auto-fired after {count} "
         "actions — your messages plus Claude's tool/file/agent calls — in this "
@@ -143,7 +221,7 @@ def quiz_directive(count, defers):
         "SUBSTANCE of THIS chat — (a) jargon/terminology used, (b) the scripts or "
         "code written/changed and WHY they work that way, (c) the project files "
         "touched and what each does. Pick the meatiest concepts, NOT conversational "
-        "trivia. " + _format_clause() + pressure +
+        f"trivia. {tools_hint}{topic_hint}" + _format_clause() + pressure +
         "Do NOT grade yet — just present the questions and wait for their reply. "
         "Tell the user this check fired automatically and is a mandatory part of "
         "their learning loop."
@@ -152,7 +230,15 @@ def quiz_directive(count, defers):
 
 def grade_directive(unlocked, seconds):
     took = f"They answered in about {seconds}s. " if seconds is not None else ""
-    unlock_note = ("Tool use is now UNLOCKED. " if unlocked else "")
+    unlock_note = "Tool use is now UNLOCKED. " if unlocked else ""
+    trim_note = ""
+    if JOURNAL_MAX:
+        trim_note = (
+            f"After appending, trim the journal so it contains at most "
+            f"{JOURNAL_MAX} dated sections (## 📅 ... headers), removing the "
+            "oldest ones from the bottom. Update the summary table at the top "
+            "to match. "
+        )
     return (
         f"The user just answered the pending learning check. {took}{unlock_note}"
         "Grade each question now: brief feedback, correct any mistakes, give a "
@@ -161,8 +247,8 @@ def grade_directive(unlocked, seconds):
         f"{JOURNAL} (create it with a short header if missing): a section dated "
         "today with a one-line topic summary and, for EACH question, a bullet "
         "with the question, the user's answer in brief, the correct answer, the "
-        "verdict, and the links. Newest entry first. Keep it concise. Then resume "
-        "what they were doing."
+        f"verdict, and the links. Newest entry first. {trim_note}"
+        "Keep it concise. Then resume what they were doing."
     )
 
 
@@ -189,7 +275,17 @@ def defer_ack_directive(defers):
             "feel the ramp, then continue with their task.")
 
 
-# --- state -------------------------------------------------------------------
+# --- state with file locking -------------------------------------------------
+
+@contextlib.contextmanager
+def _exclusive_lock():
+    """Hold an exclusive flock for the duration of the read-modify-write cycle."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(LOCK_FILE, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        yield
+
+
 def load():
     try:
         with open(STATE_FILE) as f:
@@ -199,7 +295,6 @@ def load():
 
 
 def save(state):
-    os.makedirs(STATE_DIR, exist_ok=True)
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w") as f:
         json.dump(state, f)
@@ -218,8 +313,52 @@ def _deny(reason):
         "permissionDecisionReason": reason}}))
 
 
+# --- status command ----------------------------------------------------------
+
+def cmd_status():
+    state = load()
+    g = state.get(GLOBAL_KEY, {})
+    print("=== pop-quiz status ===")
+    print(f"State file : {STATE_FILE}")
+    print(f"Journal    : {JOURNAL}")
+    print(f"Format     : {FORMAT}   threshold: {MIN_GAP}–{MAX_GAP} actions   "
+          f"questions: {NUM_Q}   max-entries: {JOURNAL_MAX or 'unlimited'}")
+    defer_str = (f"{g.get('defers', 0)}/{DEFER_LIMIT}" if DEFER_LIMIT
+                 else f"{g.get('defers', 0)} (soft mode — no freeze)")
+    print(f"Defers     : {defer_str}")
+    print(f"Locked     : {bool(g.get('locked', False))}")
+    stats = g.get("stats", {})
+    taken = stats.get("quizzes_taken", 0)
+    if taken:
+        answered = stats.get("quizzes_answered", 0)
+        deferred = stats.get("quizzes_deferred", 0)
+        print(f"Quizzes    : {taken} fired · {answered} answered · {deferred} deferred")
+    else:
+        print("Quizzes    : none yet this install")
+    sessions = {k: v for k, v in state.items()
+                if k != GLOBAL_KEY and isinstance(v, dict)}
+    if sessions:
+        now = time.time()
+        print(f"\nActive sessions ({len(sessions)}):")
+        for sid, s in sorted(sessions.items(), key=lambda x: -x[1].get("ts", 0)):
+            age_m = int((now - s.get("ts", now)) / 60)
+            seen = s.get("tools_seen", {})
+            tools_hint = (f"  tools=[{', '.join(sorted(seen.keys())[:4])}]"
+                          if seen else "")
+            print(f"  {sid[:20]}  count={s.get('count', 0)}/{s.get('threshold', '?')}  "
+                  f"pending={s.get('pending', False)}{tools_hint}  ({age_m}m ago)")
+    else:
+        print("\nNo active sessions.")
+
+
+# --- main --------------------------------------------------------------------
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "prompt"
+
+    if mode == "status":
+        cmd_status()
+        return
 
     payload = {}
     try:
@@ -229,83 +368,113 @@ def main():
     sid = str(payload.get("session_id") or "default")
     msg = payload.get("prompt") or ""
 
-    state = load()
-    now = time.time()
-    state = {k: v for k, v in state.items()
-             if k == GLOBAL_KEY or (isinstance(v, dict)
-                                    and now - v.get("ts", now) < PRUNE_AFTER)}
+    with _exclusive_lock():
+        state = load()
+        now = time.time()
+        state = {k: v for k, v in state.items()
+                 if k == GLOBAL_KEY or (isinstance(v, dict)
+                                        and now - v.get("ts", now) < PRUNE_AFTER)}
 
-    g = state.setdefault(GLOBAL_KEY, {"defers": 0, "locked": False})
-    g["ts"] = now
-    sess = state.setdefault(sid, {"count": 0, "threshold": 0})
-    sess["ts"] = now
-    locked = bool(DEFER_LIMIT) and bool(g.get("locked"))
+        g = state.setdefault(GLOBAL_KEY, {"defers": 0, "locked": False, "stats": {}})
+        g.setdefault("stats", {})
+        g["ts"] = now
+        sess = state.setdefault(sid, {"count": 0, "threshold": 0})
+        sess["ts"] = now
+        locked = bool(DEFER_LIMIT) and bool(g.get("locked"))
 
-    # --- PreToolUse: count, and freeze tools while locked --------------------
-    if mode == "tool":
-        sess["count"] = int(sess.get("count", 0)) + 1
-        save(state)
+        # --- PreToolUse: count, collect context, freeze while locked ---------
+        if mode == "tool":
+            sess["count"] = int(sess.get("count", 0)) + 1
+
+            # Collect tool name + file paths for targeted quiz questions.
+            tool_name = payload.get("tool_name") or ""
+            if not tool_name:
+                tool_name = (payload.get("tool") or {}).get("name", "")
+            if tool_name:
+                tool_input = payload.get("tool_input") or {}
+                files = []
+                for key in ("file_path", "path"):
+                    val = tool_input.get(key, "")
+                    if val and isinstance(val, str):
+                        base = os.path.basename(val)
+                        if base:
+                            files.append(base)
+                seen = sess.setdefault("tools_seen", {})
+                existing = seen.setdefault(tool_name, [])
+                for fname in files:
+                    if fname not in existing:
+                        existing.append(fname)
+                        if len(existing) > 10:
+                            existing.pop(0)
+
+            save(state)
+            if locked:
+                _deny("Learning-check lock: defer limit reached. Answer the pending "
+                      "quiz (one line, e.g. \"1C 2A 3D 4B 5A\") to unlock.")
+            sys.exit(0)
+
+        # --- UserPromptSubmit ------------------------------------------------
+        count = int(sess.get("count", 0)) + 1
+        threshold = int(sess.get("threshold", 0))
+        if not (MIN_GAP <= threshold <= MAX_GAP):
+            threshold = random.randint(MIN_GAP, MAX_GAP)
+
+        stats = g.setdefault("stats", {})
+
+        # 1) Locked: only a quiz answer unlocks.
         if locked:
-            _deny("Learning-check lock: defer limit reached. Answer the pending "
-                  "quiz (one line, e.g. \"1C 2A 3D 4B 5A\") to unlock.")
-        sys.exit(0)
+            if classify(msg) == "answer":
+                secs = (int(now - sess["issued"]) if sess.get("issued") else None)
+                g["locked"] = False
+                g["defers"] = 0
+                stats["quizzes_answered"] = stats.get("quizzes_answered", 0) + 1
+                sess["pending"] = False
+                sess["count"] = 0
+                sess["threshold"] = random.randint(MIN_GAP, MAX_GAP)
+                save(state)
+                _inject(grade_directive(unlocked=True, seconds=secs))
+            else:
+                sess["count"] = count
+                save(state)
+                _inject(locked_directive(int(g.get("defers", 0))))
+            sys.exit(0)
 
-    # --- UserPromptSubmit ----------------------------------------------------
-    count = int(sess.get("count", 0)) + 1
-    threshold = int(sess.get("threshold", 0))
-    if not (MIN_GAP <= threshold <= MAX_GAP):
-        threshold = random.randint(MIN_GAP, MAX_GAP)
-
-    # 1) Locked: only a quiz answer unlocks.
-    if locked:
-        if classify(msg) == "answer":
-            secs = int(now - sess.get("issued", now)) if sess.get("issued") else None
-            g["locked"] = False
-            g["defers"] = 0
+        # 2) A quiz is pending — was this reply an answer or a defer?
+        if sess.get("pending"):
             sess["pending"] = False
+            sess["count"] = count
+            if classify(msg) == "answer":
+                secs = (int(now - sess["issued"]) if sess.get("issued") else None)
+                g["defers"] = 0
+                stats["quizzes_answered"] = stats.get("quizzes_answered", 0) + 1
+                save(state)
+                _inject(grade_directive(unlocked=False, seconds=secs))
+            else:
+                g["defers"] = int(g.get("defers", 0)) + 1
+                stats["quizzes_deferred"] = stats.get("quizzes_deferred", 0) + 1
+                if DEFER_LIMIT and g["defers"] >= DEFER_LIMIT:
+                    g["locked"] = True
+                    save(state)
+                    _inject(locked_directive(g["defers"]))
+                else:
+                    save(state)
+                    _inject(defer_ack_directive(g["defers"]))
+            sys.exit(0)
+
+        # 3) Otherwise: fire a new quiz if this chat crossed its threshold.
+        if count >= threshold:
+            sess["pending"] = True
+            sess["issued"] = now
             sess["count"] = 0
             sess["threshold"] = random.randint(MIN_GAP, MAX_GAP)
+            stats["quizzes_taken"] = stats.get("quizzes_taken", 0) + 1
             save(state)
-            _inject(grade_directive(unlocked=True, seconds=secs))
+            _inject(quiz_directive(count, int(g.get("defers", 0)), sess))
         else:
             sess["count"] = count
+            sess["threshold"] = threshold
             save(state)
-            _inject(locked_directive(int(g.get("defers", 0))))
         sys.exit(0)
-
-    # 2) A quiz is pending — was this reply an answer or a defer?
-    if sess.get("pending"):
-        sess["pending"] = False
-        sess["count"] = count
-        if classify(msg) == "answer":
-            secs = int(now - sess.get("issued", now)) if sess.get("issued") else None
-            g["defers"] = 0
-            save(state)
-            _inject(grade_directive(unlocked=False, seconds=secs))
-        else:
-            g["defers"] = int(g.get("defers", 0)) + 1
-            if DEFER_LIMIT and g["defers"] >= DEFER_LIMIT:
-                g["locked"] = True
-                save(state)
-                _inject(locked_directive(g["defers"]))
-            else:
-                save(state)
-                _inject(defer_ack_directive(g["defers"]))
-        sys.exit(0)
-
-    # 3) Otherwise: fire a new quiz if this chat crossed its threshold.
-    if count >= threshold:
-        sess["pending"] = True
-        sess["issued"] = now
-        sess["count"] = 0
-        sess["threshold"] = random.randint(MIN_GAP, MAX_GAP)
-        save(state)
-        _inject(quiz_directive(count, int(g.get("defers", 0))))
-    else:
-        sess["count"] = count
-        sess["threshold"] = threshold
-        save(state)
-    sys.exit(0)
 
 
 if __name__ == "__main__":
