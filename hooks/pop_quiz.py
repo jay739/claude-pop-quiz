@@ -14,6 +14,8 @@ agent calls. Wired to two events with a mode argument:
     is LOCKED (defer limit hit), DENY the tool call so no work proceeds until the
     user takes the quiz.
   - "status" (CLI only): pretty-print current state, counters, and stats.
+  - "update" (CLI only): self-update — download the latest hook from GitHub and
+    overwrite this script in place (keeps its installed filename; backs up .bak).
 
 Why count tool calls too? An agentic chat can do a lot across few typed
 messages; counting only messages would let that work go unexamined.
@@ -40,6 +42,16 @@ Configuration (environment variables, all optional):
                              (default <claude-dir>/state/learning_journal.md)
   POP_QUIZ_JOURNAL_MAX_ENTRIES  keep at most this many dated entries in the
                              journal; 0 = unlimited               (default 0)
+  POP_QUIZ_REPO              owner/repo checked for updates
+                             (default jay739/claude-pop-quiz)
+  POP_QUIZ_BRANCH            branch checked for updates           (default main)
+  POP_QUIZ_NO_UPDATE_CHECK   set to any value to disable the daily online
+                             version check entirely               (default off)
+
+Updates: once a day (on UserPromptSubmit) the hook quietly checks GitHub for a
+newer __version__ and, if found, appends a one-line upgrade nudge to its next
+injected message. The check is throttled, time-boxed, and fully offline-safe —
+any failure is swallowed so the hook never breaks. Run "update" to self-upgrade.
 
 Portable: state AND the default journal live under <claude-dir>/state/, so
 copying ~/.claude/ to another machine just works — no absolute paths baked in.
@@ -60,12 +72,15 @@ import re
 import sys
 import time
 
+__version__ = "0.3.0"
+
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # e.g. ~/.claude
 STATE_DIR = os.path.join(BASE, "state")
 STATE_FILE = os.path.join(STATE_DIR, "pop_quiz_state.json")
 LOCK_FILE = STATE_FILE + ".lock"
-PRUNE_AFTER = 30 * 24 * 3600  # forget sessions untouched for 30 days
-GLOBAL_KEY = "_global"        # holds the cross-chat defer counter + lock flag
+PRUNE_AFTER = 30 * 24 * 3600   # forget sessions untouched for 30 days
+GLOBAL_KEY = "_global"         # holds the cross-chat defer counter + lock flag
+UPDATE_INTERVAL = 24 * 3600    # check GitHub for a newer version at most once/day
 
 
 def _int_env(name, default):
@@ -301,7 +316,14 @@ def save(state):
     os.replace(tmp, STATE_FILE)  # atomic write
 
 
+# Set once per UserPromptSubmit when a newer version is detected; _inject appends
+# it to whatever directive (quiz / grade / defer / nudge-only) is being sent.
+_NUDGE = ""
+
+
 def _inject(context):
+    if _NUDGE:
+        context = (context + "\n\n" + _NUDGE) if context else _NUDGE
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "UserPromptSubmit", "additionalContext": context}}))
 
@@ -313,12 +335,109 @@ def _deny(reason):
         "permissionDecisionReason": reason}}))
 
 
+# --- update checking ---------------------------------------------------------
+
+def _parse_version(s):
+    nums = re.findall(r"\d+", s or "")
+    return tuple(int(n) for n in nums[:3]) if nums else (0,)
+
+
+def _raw_url():
+    repo = os.environ.get("POP_QUIZ_REPO") or "jay739/claude-pop-quiz"
+    branch = os.environ.get("POP_QUIZ_BRANCH") or "main"
+    return f"https://raw.githubusercontent.com/{repo}/{branch}/hooks/pop_quiz.py"
+
+
+def _fetch_remote(timeout, max_bytes=0):
+    """Fetch the canonical pop_quiz.py from GitHub. Returns bytes, or None on any
+    failure (offline, timeout, 404) — callers must treat None as 'unknown'."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(_raw_url(), timeout=timeout) as r:
+            return r.read(max_bytes) if max_bytes else r.read()
+    except Exception:
+        return None
+
+
+def _remote_version(timeout=2):
+    head = _fetch_remote(timeout, max_bytes=4096)
+    if not head:
+        return None
+    m = re.search(rb'__version__\s*=\s*["\']([^"\']+)["\']', head)
+    return m.group(1).decode() if m else None
+
+
+def _update_precheck(now):
+    """OUTSIDE the lock: decide whether a daily check is due (by peeking state)
+    and, if so, do the network fetch here so we never hold the flock during I/O.
+    Returns (latest_version_or_None, did_fetch)."""
+    if os.environ.get("POP_QUIZ_NO_UPDATE_CHECK"):
+        return None, False
+    g = load().get(GLOBAL_KEY, {})
+    if now - g.get("update_checked_ts", 0) < UPDATE_INTERVAL:
+        return g.get("update_latest"), False
+    return _remote_version(), True
+
+
+def _apply_update_check(g, latest, did_fetch, now):
+    """INSIDE the lock: record the check result into global state and return a
+    one-line nudge if a newer version was newly detected (once per new version)."""
+    if did_fetch:
+        g["update_checked_ts"] = now
+        if latest:
+            g["update_latest"] = latest
+    latest = latest or g.get("update_latest")
+    if latest and _parse_version(latest) > _parse_version(__version__):
+        if g.get("update_notified") != latest:
+            g["update_notified"] = latest
+            script = os.path.abspath(__file__)
+            return (f"[pop-quiz] A newer version is available: v{latest} "
+                    f"(installed v{__version__}). Tell the user, in one line, to "
+                    f"upgrade by running: python3 {script} update")
+    return ""
+
+
+def cmd_update():
+    target = os.path.abspath(__file__)
+    latest = _remote_version(timeout=5)
+    if latest and _parse_version(latest) <= _parse_version(__version__):
+        print(f"Already up to date (v{__version__}).")
+        return
+    data = _fetch_remote(timeout=10)
+    if not data:
+        print("Update failed: could not reach GitHub. Check your connection "
+              "(or POP_QUIZ_REPO / POP_QUIZ_BRANCH).")
+        return
+    # Sanity-check the payload before trusting it over our running script.
+    if b"__version__" not in data or b"def main" not in data:
+        print("Update aborted: the downloaded file does not look like pop_quiz.py.")
+        return
+    backup = target + ".bak"
+    try:
+        if os.path.exists(target):
+            with open(target, "rb") as src, open(backup, "wb") as dst:
+                dst.write(src.read())
+        tmp = target + ".new"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, target)  # atomic; safe to overwrite the running script
+    except Exception as e:
+        print(f"Update failed while writing {target}: {e}")
+        return
+    print(f"Updated {os.path.basename(target)}: v{__version__} -> v{latest or '?'}")
+    print(f"Backup of the previous version: {backup}")
+    print("Restart Claude Code (or run /hooks) to load the new version.")
+
+
 # --- status command ----------------------------------------------------------
 
 def cmd_status():
     state = load()
     g = state.get(GLOBAL_KEY, {})
     print("=== pop-quiz status ===")
+    print(f"Version    : {__version__}")
+    print(f"Script     : {os.path.abspath(__file__)}")
     print(f"State file : {STATE_FILE}")
     print(f"Journal    : {JOURNAL}")
     print(f"Format     : {FORMAT}   threshold: {MIN_GAP}–{MAX_GAP} actions   "
@@ -327,6 +446,17 @@ def cmd_status():
                  else f"{g.get('defers', 0)} (soft mode — no freeze)")
     print(f"Defers     : {defer_str}")
     print(f"Locked     : {bool(g.get('locked', False))}")
+    # Live update check (explicit user action — network is fine here), with the
+    # cached value as fallback when offline.
+    latest = (None if os.environ.get("POP_QUIZ_NO_UPDATE_CHECK")
+              else _remote_version(timeout=3)) or g.get("update_latest")
+    if latest and _parse_version(latest) > _parse_version(__version__):
+        print(f"Update     : v{latest} available — run "
+              f"`python3 {os.path.abspath(__file__)} update`")
+    elif latest:
+        print(f"Update     : up to date (latest v{latest})")
+    else:
+        print("Update     : check skipped/unavailable")
     stats = g.get("stats", {})
     taken = stats.get("quizzes_taken", 0)
     if taken:
@@ -359,6 +489,9 @@ def main():
     if mode == "status":
         cmd_status()
         return
+    if mode == "update":
+        cmd_update()
+        return
 
     payload = {}
     try:
@@ -368,9 +501,15 @@ def main():
     sid = str(payload.get("session_id") or "default")
     msg = payload.get("prompt") or ""
 
+    # Daily update check — do the network fetch OUTSIDE the lock so we never
+    # hold the flock during I/O (prompt mode only; tool calls stay fast/silent).
+    now = time.time()
+    upd_latest = upd_did_fetch = None
+    if mode == "prompt":
+        upd_latest, upd_did_fetch = _update_precheck(now)
+
     with _exclusive_lock():
         state = load()
-        now = time.time()
         state = {k: v for k, v in state.items()
                  if k == GLOBAL_KEY or (isinstance(v, dict)
                                         and now - v.get("ts", now) < PRUNE_AFTER)}
@@ -381,6 +520,12 @@ def main():
         sess = state.setdefault(sid, {"count": 0, "threshold": 0})
         sess["ts"] = now
         locked = bool(DEFER_LIMIT) and bool(g.get("locked"))
+
+        # Record the (already-fetched) update result and arm the nudge for any
+        # message _inject sends this turn.
+        if mode == "prompt":
+            global _NUDGE
+            _NUDGE = _apply_update_check(g, upd_latest, upd_did_fetch, now)
 
         # --- PreToolUse: count, collect context, freeze while locked ---------
         if mode == "tool":
@@ -474,6 +619,9 @@ def main():
             sess["count"] = count
             sess["threshold"] = threshold
             save(state)
+            # No quiz this turn — but still surface a one-time update nudge.
+            if _NUDGE:
+                _inject("")
         sys.exit(0)
 
 

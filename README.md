@@ -56,6 +56,43 @@ rm ~/.claude/state/pop_quiz_state.json
 rm ~/.claude/state/pop_quiz_state.json.lock
 ```
 
+### Staying up to date
+
+The hook **checks itself for updates** — no need to remember to `git pull`.
+
+- Once a day (on a normal `UserPromptSubmit`), it quietly asks GitHub whether a
+  newer `__version__` exists. The check is throttled to once per 24h, time-boxed
+  to ~2s, and **fully offline-safe** — any failure is swallowed so the hook never
+  breaks or slows you down. Tool calls never hit the network.
+- When a newer version is found, it appends a **one-line nudge** to its next
+  message ("a newer version is available — run `… update`"). You're told **once**
+  per new version, not nagged every turn.
+- To upgrade in place:
+
+  ```bash
+  python3 ~/.claude/hooks/pop_quiz.py update
+  ```
+
+  This downloads the latest hook from GitHub, **backs up the current one to
+  `.bak`**, and overwrites the running script *keeping its installed filename*.
+  Restart Claude Code (or `/hooks`) to load it. Your state, journal, and defer
+  count are untouched.
+
+Check the version and update status any time:
+
+```bash
+python3 ~/.claude/hooks/pop_quiz.py status
+```
+
+The `update` command writes to **its own path**, so it works no matter what the
+installed file is called — if you renamed it (e.g. `grill_reminder.py`), it
+upgrades that file in place and keeps the name. *Existing installs predating the
+update checker need one manual `update` (or re-run `install.sh`) to gain it;
+after that they self-notify.*
+
+Forked the repo? Point the checker at your copy with `POP_QUIZ_REPO=you/your-fork`
+(and `POP_QUIZ_BRANCH=…`). Want no network at all? Set `POP_QUIZ_NO_UPDATE_CHECK=1`.
+
 ### Scope
 
 - Put the hook in **`~/.claude/settings.json`** (user scope) → fires in *every* project.
@@ -75,6 +112,9 @@ nothing is hard-coded into the script. Every knob is an environment variable:
 | `POP_QUIZ_DEFER_LIMIT` | `0` | Consecutive defers (across all chats) before tool use **freezes**; `0` = soft mode, never freeze |
 | `POP_QUIZ_JOURNAL` | `<claude-dir>/state/learning_journal.md` | Where the graded journal is written |
 | `POP_QUIZ_JOURNAL_MAX_ENTRIES` | `0` | Keep at most this many dated entries in the journal; `0` = unlimited |
+| `POP_QUIZ_REPO` | `jay739/claude-pop-quiz` | `owner/repo` the update checker pulls from (set if you forked) |
+| `POP_QUIZ_BRANCH` | `main` | Branch the update checker pulls from |
+| `POP_QUIZ_NO_UPDATE_CHECK` | *(unset)* | Set to any value to disable the daily online version check entirely |
 
 ### How to set / change them
 
