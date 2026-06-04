@@ -1,6 +1,11 @@
 # claude-pop-quiz
 
+[![version](https://img.shields.io/github/v/tag/jay739/claude-pop-quiz?label=version&sort=semver)](https://github.com/jay739/claude-pop-quiz/releases)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A **mandatory, automatic** learning-check hook for [Claude Code](https://github.com/anthropics/claude-code).
+
+> **Latest: v0.3.0** — the hook now **checks itself for updates** and can self-upgrade with `pop_quiz.py update`. See the [changelog](#changelog).
 
 Agentic coding lets you ship work without reading what the agent wrote. The risk: you end up unable to *explain* code, decisions, and tooling that are nominally "yours" — in an interview, a review, or just when the agent isn't around. This hook counters that by **pop-quizzing you on your own sessions, on a cadence you can't skip.**
 
@@ -253,6 +258,34 @@ forcing you to open files). Credit to them for prior work on the idea.
 This project differs in approach: it's a **mandatory, automatic** hook that fires on
 an action-count cadence (every ~40–45 actions) across *every* chat, rather than a
 command you have to remember to run. The two are complementary — pull vs. push.
+
+## Changelog
+
+### v0.3.0 — self-update checker
+- **Self-update:** the hook checks GitHub once a day (throttled, time-boxed,
+  offline-safe) for a newer `__version__` and appends a one-line upgrade nudge —
+  shown once per version, never on tool calls.
+- **`update` subcommand:** `pop_quiz.py update` downloads the latest hook, backs the
+  current one up to `.bak`, and overwrites in place (keeps renamed filenames).
+- **`status`** now reports installed version, script path, and live update status.
+- New env vars: `POP_QUIZ_REPO`, `POP_QUIZ_BRANCH`, `POP_QUIZ_NO_UPDATE_CHECK`.
+
+### v0.2.0 — fixes, tool context & tooling
+- **Race-condition fix:** the load/modify/save cycle is now guarded by `fcntl.flock`,
+  so parallel `PreToolUse` calls can't clobber the counter.
+- **Smarter answer detection:** work instructions ("run…", "let's…", "can you…") are
+  no longer misread as quiz answers and silently skipped.
+- **MCQ single-question fix:** a `POP_QUIZ_QUESTIONS=1` quiz can now be answered.
+- **Tool context:** `PreToolUse` records tool names + files touched, so quizzes ask
+  about the actual files you changed.
+- **Per-project topics:** a `.pop-quiz-topics` file targets questions per repo.
+- **`status` subcommand**, **`POP_QUIZ_JOURNAL_MAX_ENTRIES`** journal cap, and
+  **`uninstall.sh`**.
+
+### v0.1.0 — initial release
+- Mandatory, automatic learning-check hook firing every ~40–45 actions per chat.
+- Essay / MCQ / mixed formats, defer limit with a tool-use freeze, and a graded
+  markdown learning journal.
 
 ## License
 
