@@ -53,6 +53,17 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(pq.classify(""), "defer")
         self.assertEqual(pq.classify("   "), "defer")
 
+    def test_questions_are_not_answers(self):
+        # Regression: "who is the founder of git" used to grade as an answer
+        # because no interrogative covered it. Questions must classify as defer.
+        for q in (
+            "who is the founder of git",
+            "which branch did that merge into",
+            "the founder of git?",
+            "is macro F1 just the unweighted mean?",
+        ):
+            self.assertEqual(pq.classify(q), "defer", q)
+
 
 class McqShapeTests(unittest.TestCase):
     def test_majority_pairs_required(self):
@@ -249,6 +260,21 @@ class EndToEndCycleTests(unittest.TestCase):
         grade = self._run(
             "prompt", "1C 2A 3D 4B 5A", POP_QUIZ_MIN="1", POP_QUIZ_MAX="1"
         )
+        self.assertIn("answered the pending learning check", grade)
+
+    def test_freeze_only_unlocks_on_mcq_answer(self):
+        # Drive the chat to the freeze (DEFER_LIMIT=1), then confirm a plain
+        # question can NOT pop it — only one-line MCQ letters do.
+        env = dict(POP_QUIZ_MIN="1", POP_QUIZ_MAX="1", POP_QUIZ_DEFER_LIMIT="1")
+        self._run("prompt", "do the thing", **env)
+        lock = self._run("prompt", "defer", **env)
+        self.assertIn("FROZEN", lock)
+        # A stray question must keep it frozen, not grade.
+        still = self._run("prompt", "who is the founder of git", **env)
+        self.assertIn("FROZEN", still)
+        self.assertNotIn("answered the pending learning check", still)
+        # The documented one-line MCQ shape unlocks and grades.
+        grade = self._run("prompt", "1C 2A 3D 4B 5A", **env)
         self.assertIn("answered the pending learning check", grade)
 
 
