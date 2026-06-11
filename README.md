@@ -9,7 +9,7 @@ _Stay fluent in the code your agent wrote — get pop-quizzed on your own sessio
 [![version](https://img.shields.io/github/v/tag/jay739/claude-pop-quiz?label=version&sort=semver&color=brightgreen)](https://github.com/jay739/claude-pop-quiz/releases)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![python](https://img.shields.io/badge/python-3.6%2B-blue.svg)](https://www.python.org/)
-[![changelog](https://img.shields.io/badge/changelog-v0.5.0-orange.svg)](CHANGELOG.md)
+[![changelog](https://img.shields.io/badge/changelog-v0.5.1-orange.svg)](CHANGELOG.md)
 
 [**Install**](#-install) · [**How it works**](#-how-it-works) · [**Configuration**](#-configuration) · [**Updates**](#-staying-up-to-date) · [**Changelog**](CHANGELOG.md)
 

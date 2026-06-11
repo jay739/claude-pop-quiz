@@ -3,6 +3,18 @@
 All notable changes to **claude-pop-quiz** are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.1] — Freeze-bypass fix
+
+- **The freeze is a real backstop again.** While locked, only an actual one-line
+  MCQ answer (`1C 2A 3D 4B 5A`) unlocks — matching what the locked prompt asks
+  for and what the README always documented. The v0.4.0 lenient classifier had
+  let any non-action remark (even a question like "who is the founder of git")
+  pop the freeze without the user attempting the quiz.
+- **Questions are no longer graded as answers.** A message ending in `?`, or
+  starting with an interrogative (`who/whom/whose/which/...`), classifies as a
+  defer instead of being scored. Fixes genuine follow-up questions being eaten by
+  a pending quiz.
+
 ## [0.5.0] — Adaptive quizzing, Leitner SRS, and opt-in auto-update
 
 - **Leitner spaced repetition:** each topic's verdict history folds into a box
@@ -76,6 +88,7 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 - Essay / MCQ / mixed formats, defer limit with a tool-use freeze, and a graded
   markdown learning journal.
 
+[0.5.1]: https://github.com/jay739/claude-pop-quiz/releases/tag/v0.5.1
 [0.5.0]: https://github.com/jay739/claude-pop-quiz/releases/tag/v0.5.0
 [0.4.0]: https://github.com/jay739/claude-pop-quiz/releases/tag/v0.4.0
 [0.3.0]: https://github.com/jay739/claude-pop-quiz/releases/tag/v0.3.0

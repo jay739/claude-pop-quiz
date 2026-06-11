@@ -98,7 +98,7 @@ try:
 except ImportError:
     fcntl = None  # Degraded mode: best-effort, no advisory lock (see _exclusive_lock).
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # e.g. ~/.claude
 STATE_DIR = os.path.join(BASE, "state")
@@ -151,14 +151,17 @@ _DEFER_WORDS = {
     "skip the quiz",
 }
 
-# Messages that start with these words are work instructions, not quiz answers,
-# even if they happen to be long or contain periods.
+# Messages that start with these words are work instructions or new questions,
+# not quiz answers, even if they happen to be long or contain periods. Includes
+# the interrogatives (who/what/which/...) so "who is the founder of git" is read
+# as a question, not graded as an answer.
 _ACTION_START = re.compile(
     r"^(run|let'?s|let me|okay|ok|can you|could you|please|go ahead|now|next|"
     r"start|begin|continue|add|create|update|fix|make|change|refactor|"
     r"write|build|deploy|install|remove|delete|check|show|tell|explain|"
-    r"what|how|why|when|where|yes|no|yep|nope|sure|alright|great|thanks|"
-    r"thank|i want|i need|i'?d like|also|and|but|so|actually|hmm|hm|"
+    r"what|how|why|when|where|who|whom|whose|which|is|are|was|were|do|does|"
+    r"did|can|could|should|would|will|yes|no|yep|nope|sure|alright|great|"
+    r"thanks|thank|i want|i need|i'?d like|also|and|but|so|actually|hmm|hm|"
     r"sounds|looks|seems|that'?s|this|those|these)\b",
     re.IGNORECASE,
 )
@@ -207,8 +210,10 @@ def classify(msg):
         return "defer"
     if looks_like_mcq_answer(msg):
         return "answer"
+    if t.endswith("?"):
+        return "defer"  # a question is a question, not a quiz answer
     if _ACTION_START.match(t):
-        return "defer"  # they moved on to new work → soft defer
+        return "defer"  # they moved on to new work / asked something → soft defer
     return "answer"
 
 
@@ -1008,9 +1013,13 @@ def main():
 
         stats = g.setdefault("stats", {})
 
-        # 1) Locked: only a quiz answer unlocks.
+        # 1) Locked: only an actual one-line MCQ answer ("1C 2A 3D ...") unlocks.
+        # The freeze is the hard backstop, and the locked prompt explicitly asks
+        # for letters — so we gate on the MCQ shape, NOT the lenient classify().
+        # Otherwise any stray remark or question ("who founded git") would pop the
+        # freeze without the user ever attempting the quiz.
         if locked:
-            if classify(msg) == "answer":
+            if looks_like_mcq_answer(msg):
                 secs = int(now - sess["issued"]) if sess.get("issued") else None
                 g["locked"] = False
                 g["defers"] = 0
