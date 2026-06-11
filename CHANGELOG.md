@@ -3,6 +3,26 @@
 All notable changes to **claude-pop-quiz** are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] — Adaptive quizzing, Leitner SRS, and opt-in auto-update
+
+- **Leitner spaced repetition:** each topic's verdict history folds into a box
+  (✅ promotes, ❌ resets to 0, 🟡 holds). The least-mastered topics are fed into
+  the next quiz; mastered ones retire. Replaces the flat "recent weak topics".
+- **Adaptive difficulty:** recent accuracy tunes the questions — foundational
+  below 60%, harder above 85%.
+- **Gamification:** a correct-answer streak and lifetime accuracy are surfaced in
+  the quiz intro and in `status` to motivate.
+- **Socratic follow-ups:** on a 🟡/❌ the grader offers one guiding hint before
+  the answer instead of just handing it over.
+- **`review` command:** `pop_quiz.py review [N]` prints an offline flashcard
+  drill of the topics the SRS says are due. No model, no network, pure journal.
+- **`status`** now shows a mastery line (topics tracked · due · mastered · streak).
+- **Opt-in auto-update:** with `POP_QUIZ_AUTO_UPDATE=1` the daily check self-applies
+  a newer version (download, back up to `.bak`, atomic in-place replace) and
+  announces it; otherwise it keeps nudging. Updates touch only the script, so the
+  defer counter, lock, stats, and journal survive — locked in by a regression test.
+- New env var: `POP_QUIZ_AUTO_UPDATE`.
+
 ## [0.4.0] — Learning loop: spaced repetition, fairer quizzes, fewer false skips
 
 - **Spaced repetition:** each quiz parses the journal and pulls topics you last
@@ -56,6 +76,7 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 - Essay / MCQ / mixed formats, defer limit with a tool-use freeze, and a graded
   markdown learning journal.
 
+[0.5.0]: https://github.com/jay739/claude-pop-quiz/releases/tag/v0.5.0
 [0.4.0]: https://github.com/jay739/claude-pop-quiz/releases/tag/v0.4.0
 [0.3.0]: https://github.com/jay739/claude-pop-quiz/releases/tag/v0.3.0
 [0.2.0]: https://github.com/jay739/claude-pop-quiz/releases/tag/v0.2.0
