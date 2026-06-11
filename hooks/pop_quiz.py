@@ -61,10 +61,19 @@ Per-project topics: place a .pop-quiz-topics file in the project root (one topic
 per line, lines starting with # are comments). The hook walks up from cwd to ~
 and injects any found topics into the quiz directive for targeted questions.
 
+Spaced repetition: the grading journal is parsed back on each fire — topics the
+user previously scored partial/missed on are fed into the next quiz so weak
+areas resurface. The same parse powers a lifetime-accuracy line in "status".
+
+Robustness: harness-injected prompts (background/terminal task completions,
+[SYSTEM NOTIFICATION] wrappers) pass straight through so they can't be misread
+as a quiz answer and silently eat a pending check. Runs without fcntl too
+(degraded, lock-free) so native Windows no longer fails silently.
+
 License: MIT.
 """
+
 import contextlib
-import fcntl
 import json
 import os
 import random
@@ -72,15 +81,20 @@ import re
 import sys
 import time
 
-__version__ = "0.3.0"
+try:
+    import fcntl  # Unix only; absent on native Windows.
+except ImportError:
+    fcntl = None  # Degraded mode: best-effort, no advisory lock (see _exclusive_lock).
+
+__version__ = "0.4.0"
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # e.g. ~/.claude
 STATE_DIR = os.path.join(BASE, "state")
 STATE_FILE = os.path.join(STATE_DIR, "pop_quiz_state.json")
 LOCK_FILE = STATE_FILE + ".lock"
-PRUNE_AFTER = 30 * 24 * 3600   # forget sessions untouched for 30 days
-GLOBAL_KEY = "_global"         # holds the cross-chat defer counter + lock flag
-UPDATE_INTERVAL = 24 * 3600    # check GitHub for a newer version at most once/day
+PRUNE_AFTER = 30 * 24 * 3600  # forget sessions untouched for 30 days
+GLOBAL_KEY = "_global"  # holds the cross-chat defer counter + lock flag
+UPDATE_INTERVAL = 24 * 3600  # check GitHub for a newer version at most once/day
 
 
 def _int_env(name, default):
@@ -93,7 +107,7 @@ def _int_env(name, default):
 MIN_GAP = _int_env("POP_QUIZ_MIN", 40)
 MAX_GAP = _int_env("POP_QUIZ_MAX", 45)
 NUM_Q = _int_env("POP_QUIZ_QUESTIONS", 5)
-DEFER_LIMIT = _int_env("POP_QUIZ_DEFER_LIMIT", 0)   # 0 = soft mode, never freezes
+DEFER_LIMIT = _int_env("POP_QUIZ_DEFER_LIMIT", 0)  # 0 = soft mode, never freezes
 JOURNAL_MAX = _int_env("POP_QUIZ_JOURNAL_MAX_ENTRIES", 0)  # 0 = unlimited
 
 if MIN_GAP > MAX_GAP:
@@ -104,8 +118,9 @@ if FORMAT not in ("essay", "mcq", "mixed"):
     FORMAT = "essay"
 
 # Portable default: under <claude-dir>/state/ so it travels with ~/.claude.
-JOURNAL = os.environ.get("POP_QUIZ_JOURNAL") \
-    or os.path.join(STATE_DIR, "learning_journal.md")
+JOURNAL = os.environ.get("POP_QUIZ_JOURNAL") or os.path.join(
+    STATE_DIR, "learning_journal.md"
+)
 
 
 # --- answer classification ---------------------------------------------------
@@ -113,8 +128,16 @@ JOURNAL = os.environ.get("POP_QUIZ_JOURNAL") \
 # "1C 2A 3D 4B 5A" / "1) c, 2) a ..." → an MCQ answer.
 _MCQ_PAIR = re.compile(r"\b(\d+)\s*[)\.:\-]?\s*([A-Da-d])\b")
 
-_DEFER_WORDS = {"defer", "defer quiz", "skip", "skip quiz", "quiz later",
-                "later", "not now", "skip the quiz"}
+_DEFER_WORDS = {
+    "defer",
+    "defer quiz",
+    "skip",
+    "skip quiz",
+    "quiz later",
+    "later",
+    "not now",
+    "skip the quiz",
+}
 
 # Messages that start with these words are work instructions, not quiz answers,
 # even if they happen to be long or contain periods.
@@ -137,32 +160,48 @@ def looks_like_mcq_answer(msg):
     return len(_MCQ_PAIR.findall(msg or "")) >= need
 
 
-def looks_like_essay_answer(msg):
-    t = (msg or "").strip()
-    if not t:
-        return False
-    # Reject work instructions that are long or punctuated.
-    if _ACTION_START.match(t):
-        return False
-    return len(t) >= 80 or t.count(".") >= 2
-
-
 def is_explicit_defer(msg):
     return (msg or "").strip().lower().rstrip(".!").strip() in _DEFER_WORDS
 
 
+# Harness-injected prompts (background/terminal task completions, system
+# notifications) arrive on UserPromptSubmit but are NOT the human typing. They
+# must never be read as a quiz answer/defer or counted toward the cadence.
+_SYNTHETIC_MARKERS = ("<task-notification", "</task-notification>", "<task-id")
+
+
+def _is_synthetic_prompt(msg):
+    t = (msg or "").lstrip()
+    if t.startswith("[SYSTEM NOTIFICATION"):
+        return True
+    low = t.lower()
+    return any(mark in low for mark in _SYNTHETIC_MARKERS)
+
+
 def classify(msg):
-    """Was the user's message an answer to the pending quiz, or a defer?"""
+    """Was the user's message an answer to the pending quiz, or a defer?
+
+    A quiz is already pending whenever this runs, so the bar to count as an
+    ANSWER is deliberately low: anything that is not an explicit defer word or a
+    clear new-work instruction is treated as an attempt. A concise but correct
+    reply ("it memoizes with functools.lru_cache") must NOT be punished as a
+    skip just because it is short — the old length/period heuristic did exactly
+    that and silently consumed the quiz.
+    """
+    t = (msg or "").strip()
+    if not t:
+        return "defer"
     if is_explicit_defer(msg):
         return "defer"
     if looks_like_mcq_answer(msg):
         return "answer"
-    if FORMAT in ("essay", "mixed") and looks_like_essay_answer(msg):
-        return "answer"
-    return "defer"  # mcq mode, or a short/off-topic message → treat as a defer
+    if _ACTION_START.match(t):
+        return "defer"  # they moved on to new work → soft defer
+    return "answer"
 
 
 # --- per-project topic hints -------------------------------------------------
+
 
 def _project_topics():
     """Walk up from cwd to ~ looking for .pop-quiz-topics (one topic per line)."""
@@ -173,8 +212,9 @@ def _project_topics():
         if os.path.isfile(path):
             try:
                 with open(path) as f:
-                    return [ln.strip() for ln in f
-                            if ln.strip() and not ln.startswith("#")]
+                    return [
+                        ln.strip() for ln in f if ln.strip() and not ln.startswith("#")
+                    ]
             except Exception:
                 return []
         parent = os.path.dirname(d)
@@ -185,6 +225,7 @@ def _project_topics():
 
 
 # --- tools-seen summary for context enrichment -------------------------------
+
 
 def _tools_summary(sess):
     seen = sess.get("tools_seen") or {}
@@ -199,35 +240,124 @@ def _tools_summary(sess):
     return "Tools used this session: " + ", ".join(parts) + ". "
 
 
+# --- learning-journal parsing (accuracy + spaced repetition) -----------------
+
+# Per-question entry headers written by grade_directive, e.g.
+#   "### ✅ Q1 · HTTP cache headers"   /   "### 🟡 Q2 · Index trade-offs"
+# This is the single source of truth for both the score tally and which topics
+# the user got wrong, so the grading directive is pinned to emit this exact shape.
+_Q_HEADER = re.compile(
+    r"^#{2,4}\s*([✅\U0001F7E1❌])\s*Q\d+\s*[·:\-]?\s*(.*)$",
+    re.MULTILINE,
+)
+_VERDICT_GOOD = "✅"  # ✅ correct
+_VERDICT_PART = "\U0001f7e1"  # 🟡 partial
+_VERDICT_MISS = "❌"  # ❌ missed
+
+
+def _read_journal(max_bytes=0):
+    try:
+        with open(JOURNAL, encoding="utf-8") as f:
+            return f.read(max_bytes) if max_bytes else f.read()
+    except Exception:
+        return ""
+
+
+def _journal_accuracy():
+    """Tally graded verdicts across the whole journal. None if nothing graded."""
+    counts = {_VERDICT_GOOD: 0, _VERDICT_PART: 0, _VERDICT_MISS: 0}
+    for m in _Q_HEADER.finditer(_read_journal()):
+        counts[m.group(1)] += 1
+    total = sum(counts.values())
+    if not total:
+        return None
+    score = counts[_VERDICT_GOOD] + 0.5 * counts[_VERDICT_PART]
+    return {
+        "correct": counts[_VERDICT_GOOD],
+        "partial": counts[_VERDICT_PART],
+        "missed": counts[_VERDICT_MISS],
+        "total": total,
+        "pct": round(100 * score / total),
+    }
+
+
+def _recent_weak_topics(limit=5):
+    """Most recent topics the user scored partial/missed on (newest-first file)."""
+    topics, seen = [], set()
+    for m in _Q_HEADER.finditer(_read_journal(max_bytes=65536)):
+        if m.group(1) in (_VERDICT_PART, _VERDICT_MISS):
+            topic = m.group(2).strip().strip("`").strip()
+            key = topic.lower()
+            if topic and key not in seen:
+                seen.add(key)
+                topics.append(topic)
+                if len(topics) >= limit:
+                    break
+    return topics
+
+
 # --- directives Claude receives ----------------------------------------------
+
+# Anti-gaming guidance: without this the model reliably makes the correct MCQ
+# option the longest / most-qualified one, so "always pick the longest" wins.
+MCQ_FAIRNESS = (
+    "Keep the options fair and ungameable: make all four roughly the SAME length "
+    "and equally specific (NEVER let the correct one be the longest, the most "
+    "detailed, or the most hedged — that is a dead giveaway), vary which letter "
+    "is correct across the questions instead of clustering on one, and write "
+    "distractors that encode real misconceptions rather than obviously-wrong "
+    "filler. "
+)
+
 
 def _format_clause():
     if FORMAT == "mcq":
-        return (f"Present all {NUM_Q} questions as MULTIPLE CHOICE: 4 options "
-                "A-D each, one correct, plausible distractors. The user answers "
-                "in ONE line of letters (e.g. \"1C 2A 3D 4B 5A\") — seconds, no "
-                "essays. ")
+        return (
+            f"Present all {NUM_Q} questions as MULTIPLE CHOICE: 4 options "
+            "A-D each, one correct. " + MCQ_FAIRNESS + "The user answers "
+            'in ONE line of letters (e.g. "1C 2A 3D 4B 5A") — seconds, no '
+            "essays. "
+        )
     if FORMAT == "mixed":
-        return (f"Ask the first half of the {NUM_Q} questions as short free "
-                "response and the rest as MULTIPLE CHOICE (A-D, one line of "
-                "letters). ")
-    return ("Make the user answer in their own words. If they are short on time, "
-            "offer the quick version: the SAME questions as MULTIPLE CHOICE "
-            "(A-D, one-line letters). ")
+        return (
+            f"Ask the first half of the {NUM_Q} questions as short free "
+            "response and the rest as MULTIPLE CHOICE (A-D, one line of "
+            "letters). " + MCQ_FAIRNESS
+        )
+    return (
+        "Make the user answer in their own words. If they are short on time, "
+        "offer the quick version: the SAME questions as MULTIPLE CHOICE "
+        "(A-D, one-line letters). " + MCQ_FAIRNESS
+    )
 
 
 def quiz_directive(count, defers, sess):
     pressure = ""
     if DEFER_LIMIT:
         left = max(0, DEFER_LIMIT - defers)
-        pressure = (f"The user may DEFER (say 'defer' / 'skip quiz' or just keep "
-                    f"working), but defers are tracked across all chats: {defers} "
-                    f"used, {left} left before ALL tool use freezes until they "
-                    f"take a quiz. Mention this if they try to skip. ")
+        pressure = (
+            f"The user may DEFER (say 'defer' / 'skip quiz' or just keep "
+            f"working), but defers are tracked across all chats: {defers} "
+            f"used, {left} left before ALL tool use freezes until they "
+            f"take a quiz. Mention this if they try to skip. "
+        )
     tools_hint = _tools_summary(sess)
     topics = _project_topics()
-    topic_hint = (f"Project-specific topics to prioritise: "
-                  f"{', '.join(topics[:10])}. ") if topics else ""
+    topic_hint = (
+        (f"Project-specific topics to prioritise: " f"{', '.join(topics[:10])}. ")
+        if topics
+        else ""
+    )
+    weak = _recent_weak_topics()
+    weak_hint = (
+        (
+            f"Spaced repetition: the user previously scored partial/missed on "
+            f"{', '.join(weak)} — work AT LEAST ONE question in to revisit a weak "
+            f"area, phrased differently than before. "
+        )
+        if weak
+        else ""
+    )
     return (
         f"MANDATORY {NUM_Q}-QUESTION LEARNING CHECK (auto-fired after {count} "
         "actions — your messages plus Claude's tool/file/agent calls — in this "
@@ -236,8 +366,10 @@ def quiz_directive(count, defers, sess):
         "SUBSTANCE of THIS chat — (a) jargon/terminology used, (b) the scripts or "
         "code written/changed and WHY they work that way, (c) the project files "
         "touched and what each does. Pick the meatiest concepts, NOT conversational "
-        f"trivia. {tools_hint}{topic_hint}" + _format_clause() + pressure +
-        "Do NOT grade yet — just present the questions and wait for their reply. "
+        f"trivia. {tools_hint}{topic_hint}{weak_hint}"
+        + _format_clause()
+        + pressure
+        + "Do NOT grade yet — just present the questions and wait for their reply. "
         "Tell the user this check fired automatically and is a mandatory part of "
         "their learning loop."
     )
@@ -256,14 +388,26 @@ def grade_directive(unlocked, seconds):
         )
     return (
         f"The user just answered the pending learning check. {took}{unlock_note}"
-        "Grade each question now: brief feedback, correct any mistakes, give a "
-        "verdict (correct / partial / missed) and 1-2 study links per question, "
-        "and flag real gaps. THEN append the results to the learning journal at "
-        f"{JOURNAL} (create it with a short header if missing): a section dated "
-        "today with a one-line topic summary and, for EACH question, a bullet "
-        "with the question, the user's answer in brief, the correct answer, the "
-        f"verdict, and the links. Newest entry first. {trim_note}"
-        "Keep it concise. Then resume what they were doing."
+        "Grade each question now: brief spoken feedback, correct any mistakes, "
+        "give a verdict (correct / partial / missed) and 1-2 study links per "
+        "question, and flag real gaps. THEN append the results to the learning "
+        f"journal at {JOURNAL} (create it with a short header + a summary table if "
+        "missing). Add a section dated today, NEWEST ENTRY FIRST, with a one-line "
+        "topic summary, and render EACH question in this EXACT shape so the entry "
+        "is self-contained when re-read months later:\n"
+        "  ### <✅ correct | 🟡 partial | ❌ missed> Q<n> · <short topic title>\n"
+        "  > <the FULL question text, verbatim — include any code snippet or the "
+        "A-D options exactly as shown to the user>\n"
+        "  - **Context:** <one line naming the file, function, command, or concept "
+        "from THIS session the question was about, so the entry stands alone>\n"
+        "  - **You said:** <the user's answer in FULL — do not truncate or "
+        "paraphrase away detail>\n"
+        "  - **Answer:** <the correct answer, in full>\n"
+        "  - 🔗 <1-2 study links>\n"
+        "Record everything COMPLETELY — never cut off or abbreviate the question, "
+        "the context, the user's answer, or the correct answer; for a revision log "
+        f"completeness beats brevity. {trim_note}"
+        "Then resume what they were doing."
     )
 
 
@@ -272,9 +416,10 @@ def locked_directive(defers):
         f"LEARNING-CHECK LOCK. The user has deferred {defers} times (limit "
         f"{DEFER_LIMIT}); ALL tool use is now FROZEN and stays frozen until they "
         f"answer a quiz. Do NOT attempt the user's task or any tool call. Present "
-        f"the {NUM_Q} questions as one-line MULTIPLE CHOICE (A-D) and tell the "
-        "user plainly: they must reply with their answers (e.g. \"1C 2A 3D 4B "
-        "5A\") to unlock — nothing else will proceed. Be matter-of-fact, not "
+        f"the {NUM_Q} questions as one-line MULTIPLE CHOICE (A-D). "
+        + MCQ_FAIRNESS
+        + 'Tell the user plainly: they must reply with their answers (e.g. "1C 2A '
+        '3D 4B 5A") to unlock — nothing else will proceed. Be matter-of-fact, not '
         "preachy."
     )
 
@@ -282,20 +427,34 @@ def locked_directive(defers):
 def defer_ack_directive(defers):
     left = max(0, DEFER_LIMIT - defers) if DEFER_LIMIT else None
     if left is None:
-        return ("The user deferred the learning check. Note it briefly and "
-                "continue — but encourage them to take the quick MCQ version "
-                "soon.")
-    return (f"The user deferred the learning check ({defers}/{DEFER_LIMIT}; "
-            f"{left} left before tool use freezes). Note this in one line so they "
-            "feel the ramp, then continue with their task.")
+        return (
+            "The user deferred the learning check. Note it briefly and "
+            "continue — but encourage them to take the quick MCQ version "
+            "soon."
+        )
+    return (
+        f"The user deferred the learning check ({defers}/{DEFER_LIMIT}; "
+        f"{left} left before tool use freezes). Note this in one line so they "
+        "feel the ramp, then continue with their task."
+    )
 
 
 # --- state with file locking -------------------------------------------------
 
+
 @contextlib.contextmanager
 def _exclusive_lock():
-    """Hold an exclusive flock for the duration of the read-modify-write cycle."""
+    """Hold an exclusive flock for the duration of the read-modify-write cycle.
+
+    On platforms without fcntl (native Windows) we degrade to a best-effort,
+    lock-free cycle rather than crashing the hook outright — saves stay atomic
+    via os.replace, so the only exposure is a rare lost counter increment under
+    heavy parallel tool calls.
+    """
     os.makedirs(STATE_DIR, exist_ok=True)
+    if fcntl is None:
+        yield
+        return
     with open(LOCK_FILE, "w") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
         yield
@@ -324,18 +483,34 @@ _NUDGE = ""
 def _inject(context):
     if _NUDGE:
         context = (context + "\n\n" + _NUDGE) if context else _NUDGE
-    print(json.dumps({"hookSpecificOutput": {
-        "hookEventName": "UserPromptSubmit", "additionalContext": context}}))
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": context,
+                }
+            }
+        )
+    )
 
 
 def _deny(reason):
-    print(json.dumps({"hookSpecificOutput": {
-        "hookEventName": "PreToolUse",
-        "permissionDecision": "deny",
-        "permissionDecisionReason": reason}}))
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                }
+            }
+        )
+    )
 
 
 # --- update checking ---------------------------------------------------------
+
 
 def _parse_version(s):
     nums = re.findall(r"\d+", s or "")
@@ -352,6 +527,7 @@ def _fetch_remote(timeout, max_bytes=0):
     """Fetch the canonical pop_quiz.py from GitHub. Returns bytes, or None on any
     failure (offline, timeout, 404) — callers must treat None as 'unknown'."""
     import urllib.request
+
     try:
         with urllib.request.urlopen(_raw_url(), timeout=timeout) as r:
             return r.read(max_bytes) if max_bytes else r.read()
@@ -391,9 +567,11 @@ def _apply_update_check(g, latest, did_fetch, now):
         if g.get("update_notified") != latest:
             g["update_notified"] = latest
             script = os.path.abspath(__file__)
-            return (f"[pop-quiz] A newer version is available: v{latest} "
-                    f"(installed v{__version__}). Tell the user, in one line, to "
-                    f"upgrade by running: python3 {script} update")
+            return (
+                f"[pop-quiz] A newer version is available: v{latest} "
+                f"(installed v{__version__}). Tell the user, in one line, to "
+                f"upgrade by running: python3 {script} update"
+            )
     return ""
 
 
@@ -405,11 +583,15 @@ def cmd_update():
         return
     data = _fetch_remote(timeout=10)
     if not data:
-        print("Update failed: could not reach GitHub. Check your connection "
-              "(or POP_QUIZ_REPO / POP_QUIZ_BRANCH).")
+        print(
+            "Update failed: could not reach GitHub. Check your connection "
+            "(or POP_QUIZ_REPO / POP_QUIZ_BRANCH)."
+        )
         return
-    # Sanity-check the payload before trusting it over our running script.
-    if b"__version__" not in data or b"def main" not in data:
+    # Sanity-check the payload before trusting it over our running script: it
+    # must look like a real, reasonably-sized pop_quiz.py, not an error page.
+    markers = (b"__version__", b"def main", b"def quiz_directive", b"def classify")
+    if len(data) < 4096 or any(m not in data for m in markers):
         print("Update aborted: the downloaded file does not look like pop_quiz.py.")
         return
     backup = target + ".bak"
@@ -432,6 +614,7 @@ def cmd_update():
 
 # --- status command ----------------------------------------------------------
 
+
 def cmd_status():
     state = load()
     g = state.get(GLOBAL_KEY, {})
@@ -440,19 +623,29 @@ def cmd_status():
     print(f"Script     : {os.path.abspath(__file__)}")
     print(f"State file : {STATE_FILE}")
     print(f"Journal    : {JOURNAL}")
-    print(f"Format     : {FORMAT}   threshold: {MIN_GAP}–{MAX_GAP} actions   "
-          f"questions: {NUM_Q}   max-entries: {JOURNAL_MAX or 'unlimited'}")
-    defer_str = (f"{g.get('defers', 0)}/{DEFER_LIMIT}" if DEFER_LIMIT
-                 else f"{g.get('defers', 0)} (soft mode — no freeze)")
+    print(
+        f"Format     : {FORMAT}   threshold: {MIN_GAP}–{MAX_GAP} actions   "
+        f"questions: {NUM_Q}   max-entries: {JOURNAL_MAX or 'unlimited'}"
+    )
+    defer_str = (
+        f"{g.get('defers', 0)}/{DEFER_LIMIT}"
+        if DEFER_LIMIT
+        else f"{g.get('defers', 0)} (soft mode — no freeze)"
+    )
     print(f"Defers     : {defer_str}")
     print(f"Locked     : {bool(g.get('locked', False))}")
     # Live update check (explicit user action — network is fine here), with the
     # cached value as fallback when offline.
-    latest = (None if os.environ.get("POP_QUIZ_NO_UPDATE_CHECK")
-              else _remote_version(timeout=3)) or g.get("update_latest")
+    latest = (
+        None
+        if os.environ.get("POP_QUIZ_NO_UPDATE_CHECK")
+        else _remote_version(timeout=3)
+    ) or g.get("update_latest")
     if latest and _parse_version(latest) > _parse_version(__version__):
-        print(f"Update     : v{latest} available — run "
-              f"`python3 {os.path.abspath(__file__)} update`")
+        print(
+            f"Update     : v{latest} available — run "
+            f"`python3 {os.path.abspath(__file__)} update`"
+        )
     elif latest:
         print(f"Update     : up to date (latest v{latest})")
     else:
@@ -465,23 +658,34 @@ def cmd_status():
         print(f"Quizzes    : {taken} fired · {answered} answered · {deferred} deferred")
     else:
         print("Quizzes    : none yet this install")
-    sessions = {k: v for k, v in state.items()
-                if k != GLOBAL_KEY and isinstance(v, dict)}
+    acc = _journal_accuracy()
+    if acc:
+        print(
+            f"Accuracy   : {acc['pct']}%   ({acc['correct']} ✅ · {acc['partial']} 🟡 "
+            f"· {acc['missed']} ❌ over {acc['total']} graded questions)"
+        )
+    sessions = {
+        k: v for k, v in state.items() if k != GLOBAL_KEY and isinstance(v, dict)
+    }
     if sessions:
         now = time.time()
         print(f"\nActive sessions ({len(sessions)}):")
         for sid, s in sorted(sessions.items(), key=lambda x: -x[1].get("ts", 0)):
             age_m = int((now - s.get("ts", now)) / 60)
             seen = s.get("tools_seen", {})
-            tools_hint = (f"  tools=[{', '.join(sorted(seen.keys())[:4])}]"
-                          if seen else "")
-            print(f"  {sid[:20]}  count={s.get('count', 0)}/{s.get('threshold', '?')}  "
-                  f"pending={s.get('pending', False)}{tools_hint}  ({age_m}m ago)")
+            tools_hint = (
+                f"  tools=[{', '.join(sorted(seen.keys())[:4])}]" if seen else ""
+            )
+            print(
+                f"  {sid[:20]}  count={s.get('count', 0)}/{s.get('threshold', '?')}  "
+                f"pending={s.get('pending', False)}{tools_hint}  ({age_m}m ago)"
+            )
     else:
         print("\nNo active sessions.")
 
 
 # --- main --------------------------------------------------------------------
+
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "prompt"
@@ -501,6 +705,14 @@ def main():
     sid = str(payload.get("session_id") or "default")
     msg = payload.get("prompt") or ""
 
+    # A harness-injected event (background/terminal task completion, system
+    # notification) is NOT the user typing: passing it through keeps a pending
+    # quiz pending instead of silently consuming it as a non-answer, and keeps it
+    # from counting toward the cadence. Tool mode is real activity, so only guard
+    # prompt mode.
+    if mode == "prompt" and _is_synthetic_prompt(msg):
+        sys.exit(0)
+
     # Daily update check — do the network fetch OUTSIDE the lock so we never
     # hold the flock during I/O (prompt mode only; tool calls stay fast/silent).
     now = time.time()
@@ -510,9 +722,12 @@ def main():
 
     with _exclusive_lock():
         state = load()
-        state = {k: v for k, v in state.items()
-                 if k == GLOBAL_KEY or (isinstance(v, dict)
-                                        and now - v.get("ts", now) < PRUNE_AFTER)}
+        state = {
+            k: v
+            for k, v in state.items()
+            if k == GLOBAL_KEY
+            or (isinstance(v, dict) and now - v.get("ts", now) < PRUNE_AFTER)
+        }
 
         g = state.setdefault(GLOBAL_KEY, {"defers": 0, "locked": False, "stats": {}})
         g.setdefault("stats", {})
@@ -554,8 +769,10 @@ def main():
 
             save(state)
             if locked:
-                _deny("Learning-check lock: defer limit reached. Answer the pending "
-                      "quiz (one line, e.g. \"1C 2A 3D 4B 5A\") to unlock.")
+                _deny(
+                    "Learning-check lock: defer limit reached. Answer the pending "
+                    'quiz (one line, e.g. "1C 2A 3D 4B 5A") to unlock.'
+                )
             sys.exit(0)
 
         # --- UserPromptSubmit ------------------------------------------------
@@ -569,7 +786,7 @@ def main():
         # 1) Locked: only a quiz answer unlocks.
         if locked:
             if classify(msg) == "answer":
-                secs = (int(now - sess["issued"]) if sess.get("issued") else None)
+                secs = int(now - sess["issued"]) if sess.get("issued") else None
                 g["locked"] = False
                 g["defers"] = 0
                 stats["quizzes_answered"] = stats.get("quizzes_answered", 0) + 1
@@ -589,7 +806,7 @@ def main():
             sess["pending"] = False
             sess["count"] = count
             if classify(msg) == "answer":
-                secs = (int(now - sess["issued"]) if sess.get("issued") else None)
+                secs = int(now - sess["issued"]) if sess.get("issued") else None
                 g["defers"] = 0
                 stats["quizzes_answered"] = stats.get("quizzes_answered", 0) + 1
                 save(state)

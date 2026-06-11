@@ -42,21 +42,33 @@ except Exception:
 
 hooks = cfg.setdefault("hooks", {})
 
-# Build an env prefix for the prompt command from the chosen config.
+# Build an env prefix for the prompt command from the chosen config. Every knob
+# documented in the README is honoured here, so re-running the installer with
+# e.g. POP_QUIZ_MIN/MAX/QUESTIONS actually changes the baked command (it used to
+# silently drop those, contradicting the docs).
 _fmt = os.environ.get("POP_QUIZ_FORMAT", "essay")
 _defer = os.environ.get("POP_QUIZ_DEFER_LIMIT", "0")
+
+# (var name, env value, default it's dropped when equal to)
+_KNOBS = [
+    ("POP_QUIZ_FORMAT", _fmt, "essay"),
+    ("POP_QUIZ_DEFER_LIMIT", _defer, "0"),
+    ("POP_QUIZ_JOURNAL_MAX_ENTRIES", os.environ.get("POP_QUIZ_JOURNAL_MAX_ENTRIES", "0"), "0"),
+    ("POP_QUIZ_MIN", os.environ.get("POP_QUIZ_MIN", ""), ""),
+    ("POP_QUIZ_MAX", os.environ.get("POP_QUIZ_MAX", ""), ""),
+    ("POP_QUIZ_QUESTIONS", os.environ.get("POP_QUIZ_QUESTIONS", ""), ""),
+    ("POP_QUIZ_JOURNAL", os.environ.get("POP_QUIZ_JOURNAL", ""), ""),
+]
 
 def ensure(event, mode):
     # Both commands get the same config: the tool-mode hook needs
     # POP_QUIZ_DEFER_LIMIT to know whether to freeze, not just the prompt hook.
-    _max = os.environ.get("POP_QUIZ_JOURNAL_MAX_ENTRIES", "0")
     envs = []
-    if _fmt and _fmt != "essay":
-        envs.append(f"POP_QUIZ_FORMAT={_fmt}")
-    if _defer and _defer != "0":
-        envs.append(f"POP_QUIZ_DEFER_LIMIT={_defer}")
-    if _max and _max != "0":
-        envs.append(f"POP_QUIZ_JOURNAL_MAX_ENTRIES={_max}")
+    for name, val, default in _KNOBS:
+        if val and val != default:
+            # Quote values that may contain spaces (e.g. a journal path) so the
+            # baked shell command stays valid.
+            envs.append(f'{name}="{val}"' if (" " in val) else f"{name}={val}")
     prefix = (" ".join(envs) + " ") if envs else ""
     cmd = f"{prefix}python3 ~/.claude/hooks/pop_quiz.py {mode} 2>/dev/null || true"
     arr = hooks.setdefault(event, [])
