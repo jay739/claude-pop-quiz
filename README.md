@@ -4,12 +4,12 @@
 
 **A mandatory, automatic learning-check hook for [Claude Code](https://github.com/anthropics/claude-code).**
 
-*Stay fluent in the code your agent wrote — get pop-quizzed on your own sessions, on a cadence you can't skip.*
+_Stay fluent in the code your agent wrote — get pop-quizzed on your own sessions, on a cadence you can't skip._
 
 [![version](https://img.shields.io/github/v/tag/jay739/claude-pop-quiz?label=version&sort=semver&color=brightgreen)](https://github.com/jay739/claude-pop-quiz/releases)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![python](https://img.shields.io/badge/python-3.6%2B-blue.svg)](https://www.python.org/)
-[![changelog](https://img.shields.io/badge/changelog-v0.3.0-orange.svg)](CHANGELOG.md)
+[![changelog](https://img.shields.io/badge/changelog-v0.4.0-orange.svg)](CHANGELOG.md)
 
 [**Install**](#-install) · [**How it works**](#-how-it-works) · [**Configuration**](#-configuration) · [**Updates**](#-staying-up-to-date) · [**Changelog**](CHANGELOG.md)
 
@@ -17,11 +17,13 @@
 
 ---
 
-Agentic coding lets you ship work without reading what the agent wrote. The risk: you end up unable to *explain* code, decisions, and tooling that are nominally "yours" — in an interview, a review, or just when the agent isn't around. This hook counters that by **pop-quizzing you on your own sessions, on a cadence you can't skip.**
+Agentic coding lets you ship work without reading what the agent wrote. The risk: you end up unable to _explain_ code, decisions, and tooling that are nominally "yours" — in an interview, a review, or just when the agent isn't around. This hook counters that by **pop-quizzing you on your own sessions, on a cadence you can't skip.**
 
-Every ~40–45 *actions* in a chat (your messages **plus** every tool/file/agent call Claude makes), it pauses and makes you answer 5 questions about the technical substance of that session — the jargon used, the code written and *why*, and the files touched. You answer in your own words; Claude grades you and flags gaps.
+Every ~40–45 _actions_ in a chat (your messages **plus** every tool/file/agent call Claude makes), it pauses and makes you answer 5 questions about the technical substance of that session — the jargon used, the code written and _why_, and the files touched. You answer in your own words; Claude grades you and flags gaps.
 
-After grading, Claude appends the results to a **learning journal** — a markdown revision log of every quiz: each question, your answer, the correct answer, a ✅/🟡/❌ verdict, and links to study. Re-read it later, or point it at a git repo to version your progress. See [`JOURNAL.example.md`](JOURNAL.example.md) for the format.
+After grading, Claude appends the results to a **learning journal** — a markdown revision log of every quiz: each question, your answer, the correct answer, a ✅/🟡/❌ verdict, a one-line **context** note (the file or concept the question came from, so the entry stands alone months later), and links to study. Re-read it later, or point it at a git repo to version your progress. See [`JOURNAL.example.md`](JOURNAL.example.md) for the format.
+
+That journal is also read **back in**: the next quiz pulls topics you previously scored partial or missed and works at least one in again (lightweight **spaced repetition**), and `status` reports your lifetime accuracy from the graded verdicts.
 
 > [!NOTE]
 > Your real journal holds your actual answers, so it's **personal and gitignored by
@@ -32,15 +34,15 @@ After grading, Claude appends the results to a **learning journal** — a markdo
 
 It's two hooks pointing at one script, wired in your Claude Code `settings.json`:
 
-| Event | Mode | What it does |
-|---|---|---|
-| `PreToolUse` (all tools) | `tool` | Increments the per-chat counter **silently**, records the tool name and files touched for targeted questions — never interrupts |
-| `UserPromptSubmit` | `prompt` | Increments, and if the chat crossed its threshold, **injects the quiz** and resets |
+| Event                    | Mode     | What it does                                                                                                                    |
+| ------------------------ | -------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `PreToolUse` (all tools) | `tool`   | Increments the per-chat counter **silently**, records the tool name and files touched for targeted questions — never interrupts |
+| `UserPromptSubmit`       | `prompt` | Increments, and if the chat crossed its threshold, **injects the quiz** and resets                                              |
 
 Design choices worth knowing:
 
 - **Counts all activity, not just messages.** A heavily agentic chat with 3 typed messages but 80 tool calls still gets examined. (`UserPromptSubmit` alone would never fire there.)
-- **Fires only at a message boundary.** Tool calls increment but never inject, so the quiz appears at the *start of your next message* — never mid-task.
+- **Fires only at a message boundary.** Tool calls increment but never inject, so the quiz appears at the _start of your next message_ — never mid-task.
 - **Per chat.** State is keyed by `session_id`, so concurrent chats each track their own count.
 - **Randomized threshold** (default 40–45) so the cadence isn't gameable.
 - **Self-contained.** State lives under `<claude-dir>/state/`; copy `~/.claude/` to another machine and it just works.
@@ -64,7 +66,8 @@ Prefer to wire it by hand? Copy the `hooks` block from
 > [!TIP]
 > The hook loads automatically in **new** chats. To activate it in an already-open
 > session, run `/hooks` once. Requires only **Python 3.6+** — no pip installs, no
-> dependencies.
+> dependencies. macOS, Linux, and WSL use a real file lock; native Windows runs
+> in a degraded lock-free mode (no `fcntl`) rather than failing silently.
 
 ### Uninstall
 
@@ -104,7 +107,7 @@ The hook **checks itself for updates** — no need to remember to `git pull`.
   ```
 
   This downloads the latest hook from GitHub, **backs up the current one to
-  `.bak`**, and overwrites the running script *keeping its installed filename*.
+  `.bak`**, and overwrites the running script _keeping its installed filename_.
   Restart Claude Code (or `/hooks`) to load it. Your state, journal, and defer
   count are untouched.
 
@@ -116,16 +119,16 @@ python3 ~/.claude/hooks/pop_quiz.py status
 
 The `update` command writes to **its own path**, so it works no matter what the
 installed file is called — if you renamed it (e.g. `grill_reminder.py`), it
-upgrades that file in place and keeps the name. *Existing installs predating the
+upgrades that file in place and keeps the name. _Existing installs predating the
 update checker need one manual `update` (or re-run `install.sh`) to gain it;
-after that they self-notify.*
+after that they self-notify._
 
 Forked the repo? Point the checker at your copy with `POP_QUIZ_REPO=you/your-fork`
 (and `POP_QUIZ_BRANCH=…`). Want no network at all? Set `POP_QUIZ_NO_UPDATE_CHECK=1`.
 
 ### Scope
 
-- Put the hook in **`~/.claude/settings.json`** (user scope) → fires in *every* project.
+- Put the hook in **`~/.claude/settings.json`** (user scope) → fires in _every_ project.
 - Put it in a project's **`.claude/settings.json`** → fires only in that project.
 
 ## 🔧 Configuration
@@ -133,18 +136,18 @@ Forked the repo? Point the checker at your copy with `POP_QUIZ_REPO=you/your-for
 **Everything is optional and tweakable** — the hook ships with sane defaults and
 nothing is hard-coded into the script. Every knob is an environment variable:
 
-| Variable | Default | What it does |
-|---|---|---|
-| `POP_QUIZ_MIN` | `40` | Lower bound of the random action threshold (how *often* it fires) |
-| `POP_QUIZ_MAX` | `45` | Upper bound of the random action threshold |
-| `POP_QUIZ_QUESTIONS` | `5` | Number of questions per check |
-| `POP_QUIZ_FORMAT` | `essay` | `essay`, `mcq`, or `mixed` — see [Quiz format](#-quiz-format--cant-i-just-skip-it) |
-| `POP_QUIZ_DEFER_LIMIT` | `0` | Consecutive defers (across all chats) before tool use **freezes**; `0` = soft mode, never freeze |
-| `POP_QUIZ_JOURNAL` | `<claude-dir>/state/learning_journal.md` | Where the graded journal is written |
-| `POP_QUIZ_JOURNAL_MAX_ENTRIES` | `0` | Keep at most this many dated entries in the journal; `0` = unlimited |
-| `POP_QUIZ_REPO` | `jay739/claude-pop-quiz` | `owner/repo` the update checker pulls from (set if you forked) |
-| `POP_QUIZ_BRANCH` | `main` | Branch the update checker pulls from |
-| `POP_QUIZ_NO_UPDATE_CHECK` | *(unset)* | Set to any value to disable the daily online version check entirely |
+| Variable                       | Default                                  | What it does                                                                                     |
+| ------------------------------ | ---------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `POP_QUIZ_MIN`                 | `40`                                     | Lower bound of the random action threshold (how _often_ it fires)                                |
+| `POP_QUIZ_MAX`                 | `45`                                     | Upper bound of the random action threshold                                                       |
+| `POP_QUIZ_QUESTIONS`           | `5`                                      | Number of questions per check                                                                    |
+| `POP_QUIZ_FORMAT`              | `essay`                                  | `essay`, `mcq`, or `mixed` — see [Quiz format](#-quiz-format--cant-i-just-skip-it)               |
+| `POP_QUIZ_DEFER_LIMIT`         | `0`                                      | Consecutive defers (across all chats) before tool use **freezes**; `0` = soft mode, never freeze |
+| `POP_QUIZ_JOURNAL`             | `<claude-dir>/state/learning_journal.md` | Where the graded journal is written                                                              |
+| `POP_QUIZ_JOURNAL_MAX_ENTRIES` | `0`                                      | Keep at most this many dated entries in the journal; `0` = unlimited                             |
+| `POP_QUIZ_REPO`                | `jay739/claude-pop-quiz`                 | `owner/repo` the update checker pulls from (set if you forked)                                   |
+| `POP_QUIZ_BRANCH`              | `main`                                   | Branch the update checker pulls from                                                             |
+| `POP_QUIZ_NO_UPDATE_CHECK`     | _(unset)_                                | Set to any value to disable the daily online version check entirely                              |
 
 ### How to set / change them
 
@@ -152,13 +155,15 @@ These values get **baked into the hook command** in your `~/.claude/settings.jso
 Two ways to change them — both safe to repeat:
 
 1. **Re-run the installer with env vars** (it rewrites the command for you):
+
    ```bash
    POP_QUIZ_FORMAT=mcq POP_QUIZ_DEFER_LIMIT=3 ./install.sh
    ```
+
    Run with no env and it also **prompts** you for format, defer limit, and max journal entries.
 
 2. **Edit the command directly** in `~/.claude/settings.json` — prepend the vars
-   to *both* the `UserPromptSubmit` and `PreToolUse` commands (the freeze needs
+   to _both_ the `UserPromptSubmit` and `PreToolUse` commands (the freeze needs
    `POP_QUIZ_DEFER_LIMIT` on both):
    ```json
    "command": "POP_QUIZ_MIN=90 POP_QUIZ_MAX=110 POP_QUIZ_QUESTIONS=3 POP_QUIZ_FORMAT=mcq POP_QUIZ_DEFER_LIMIT=3 POP_QUIZ_JOURNAL=$HOME/notes/learning_journal.md python3 ~/.claude/hooks/pop_quiz.py prompt 2>/dev/null || true"
@@ -188,14 +193,20 @@ Common tweaks:
 
 ### Format: pick your friction
 
-| `POP_QUIZ_FORMAT` | What you get |
-|---|---|
-| `essay` *(default)* | Free-response answers in your own words. If you're short on time, Claude offers the **MCQ quick version** of the *same* questions. |
-| `mcq` | Every question is **multiple choice** (A–D, one correct). You answer in a single line of letters — e.g. `1C 2A 3D 4B 5A`. Seconds, no typing. |
-| `mixed` | Half free-response, half multiple choice. |
+| `POP_QUIZ_FORMAT`   | What you get                                                                                                                                  |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `essay` _(default)_ | Free-response answers in your own words. If you're short on time, Claude offers the **MCQ quick version** of the _same_ questions.            |
+| `mcq`               | Every question is **multiple choice** (A–D, one correct). You answer in a single line of letters — e.g. `1C 2A 3D 4B 5A`. Seconds, no typing. |
+| `mixed`             | Half free-response, half multiple choice.                                                                                                     |
 
 Either way you're graded, corrected, and **journaled** — a 15-second MCQ round is
 real revision, not a bypass.
+
+> [!NOTE]
+> MCQ options are constrained to be **ungameable**: all four roughly equal in
+> length and specificity, the correct letter varied across questions, and
+> distractors that encode real misconceptions. The old "just pick the longest
+> option" tell no longer works.
 
 ### Defer & the hard stop
 
@@ -207,7 +218,7 @@ anything until you answer a quiz. Submitting an answer (the hook recognizes the
 one-line `1C 2A 3D 4B 5A` shape) resets the counter and unlocks.
 
 > [!WARNING]
-> The freeze is **global** — once the defer limit is hit, *every* chat is frozen,
+> The freeze is **global** — once the defer limit is hit, _every_ chat is frozen,
 > not just the one you deferred in. Answering any pending quiz unlocks them all.
 > Set `POP_QUIZ_DEFER_LIMIT=0` (the default) to stay in soft mode and never freeze.
 
@@ -219,19 +230,19 @@ one-line `1C 2A 3D 4B 5A` shape) resets the counter and unlocks.
 
 This is a **discipline gate, not a vault.** Two things no hook can do:
 
-1. **Judge understanding.** The hook checks an answer's *shape*, not its
+1. **Judge understanding.** The hook checks an answer's _shape_, not its
    correctness — only the model grades that, and the model is cooperative, so it
-   can be talked past. The hard stop forces you to *submit an attempt*, not to
+   can be talked past. The hard stop forces you to _submit an attempt_, not to
    pass.
 2. **Defend against its owner.** It's your `settings.json` and your script — one
-   commented line disables it. It exists to stop *drift*, not a determined you.
+   commented line disables it. It exists to stop _drift_, not a determined you.
 
 The real lever is making the quiz cheap (MCQ = seconds) so answering beats
 dodging. The freeze is the backstop for when you'd otherwise let it slide.
 
 > **Live per-question timer?** Not possible in Claude Code — it's turn-based, and
 > nothing runs during your think-time to enforce a countdown or auto-skip. The
-> hook *can* read the clock and log how long you took, and a non-answer counts as
+> hook _can_ read the clock and log how long you took, and a non-answer counts as
 > a defer, but there's no live 15-second timer.
 
 ## 📁 Per-project topic hints
@@ -286,13 +297,14 @@ command and adds nice extras (grading levels, a review queue, module-focused qui
 forcing you to open files). Credit to them for prior work on the idea.
 
 This project differs in approach: it's a **mandatory, automatic** hook that fires on
-an action-count cadence (every ~40–45 actions) across *every* chat, rather than a
+an action-count cadence (every ~40–45 actions) across _every_ chat, rather than a
 command you have to remember to run. The two are complementary — pull vs. push.
 
 ## 📜 Changelog
 
-Version history lives in **[CHANGELOG.md](CHANGELOG.md)**. Current release: **v0.3.0**
-(self-update checker — see [Staying up to date](#-staying-up-to-date)).
+Version history lives in **[CHANGELOG.md](CHANGELOG.md)**. Current release: **v0.4.0**
+(spaced repetition, accuracy in `status`, fairer MCQs, and the synthetic-prompt /
+concise-answer bug fixes).
 
 ## 📄 License
 

@@ -3,6 +3,30 @@
 All notable changes to **claude-pop-quiz** are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] — Learning loop: spaced repetition, fairer quizzes, fewer false skips
+
+- **Spaced repetition:** each quiz parses the journal and pulls topics you last
+  scored partial/missed on, then works at least one back in, rephrased.
+- **Real accuracy in `status`:** lifetime ✅/🟡/❌ tally and a score percent,
+  read straight from the journal's graded verdicts.
+- **Richer journal entries:** every question is now logged with a **Context**
+  line (the file/function/command it came from) and the question, your answer,
+  and the correct answer recorded in **full** — no more truncated entries.
+- **Fairer MCQs:** options are constrained to equal length and specificity with
+  the correct letter varied, so "always pick the longest option" no longer wins.
+- **Bug — synthetic prompts no longer eat a pending quiz:** background/terminal
+  task completions and `[SYSTEM NOTIFICATION]` events pass through instead of
+  being misread as your answer and silently consuming the check.
+- **Bug — concise correct answers count:** a short, right reply ("it memoizes
+  with `lru_cache`") is graded, not scored as a skip toward the freeze limit.
+- **Bug — installer honours every knob:** re-running with `POP_QUIZ_MIN`/`MAX`/
+  `QUESTIONS`/`JOURNAL` now bakes them into the command (they were silently
+  dropped, contradicting the docs).
+- **Windows:** runs without `fcntl` in a degraded lock-free mode instead of
+  failing silently.
+- **Tests + CI:** a stdlib `unittest` suite and a GitHub Actions matrix
+  (Ubuntu + Windows, Python 3.8/3.12).
+
 ## [0.3.0] — Self-update checker
 
 - **Self-update:** the hook checks GitHub once a day (throttled, time-boxed,
@@ -32,6 +56,7 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 - Essay / MCQ / mixed formats, defer limit with a tool-use freeze, and a graded
   markdown learning journal.
 
+[0.4.0]: https://github.com/jay739/claude-pop-quiz/releases/tag/v0.4.0
 [0.3.0]: https://github.com/jay739/claude-pop-quiz/releases/tag/v0.3.0
 [0.2.0]: https://github.com/jay739/claude-pop-quiz/releases/tag/v0.2.0
 [0.1.0]: https://github.com/jay739/claude-pop-quiz/releases/tag/v0.1.0
