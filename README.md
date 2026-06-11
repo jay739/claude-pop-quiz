@@ -9,7 +9,7 @@ _Stay fluent in the code your agent wrote — get pop-quizzed on your own sessio
 [![version](https://img.shields.io/github/v/tag/jay739/claude-pop-quiz?label=version&sort=semver&color=brightgreen)](https://github.com/jay739/claude-pop-quiz/releases)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![python](https://img.shields.io/badge/python-3.6%2B-blue.svg)](https://www.python.org/)
-[![changelog](https://img.shields.io/badge/changelog-v0.4.0-orange.svg)](CHANGELOG.md)
+[![changelog](https://img.shields.io/badge/changelog-v0.5.0-orange.svg)](CHANGELOG.md)
 
 [**Install**](#-install) · [**How it works**](#-how-it-works) · [**Configuration**](#-configuration) · [**Updates**](#-staying-up-to-date) · [**Changelog**](CHANGELOG.md)
 
@@ -23,7 +23,12 @@ Every ~40–45 _actions_ in a chat (your messages **plus** every tool/file/agent
 
 After grading, Claude appends the results to a **learning journal** — a markdown revision log of every quiz: each question, your answer, the correct answer, a ✅/🟡/❌ verdict, a one-line **context** note (the file or concept the question came from, so the entry stands alone months later), and links to study. Re-read it later, or point it at a git repo to version your progress. See [`JOURNAL.example.md`](JOURNAL.example.md) for the format.
 
-That journal is also read **back in**: the next quiz pulls topics you previously scored partial or missed and works at least one in again (lightweight **spaced repetition**), and `status` reports your lifetime accuracy from the graded verdicts.
+That journal is also read **back in** to make each round smarter:
+
+- **Leitner spaced repetition.** Every topic's verdict history folds into a box — a ✅ promotes it, a ❌ resets it, a 🟡 holds. The next quiz pulls your least-mastered topics and retires the ones you've nailed, so weak areas keep coming back until they stick.
+- **Adaptive difficulty.** Your recent accuracy tunes the questions: foundational when you're below 60%, harder (edge cases, trade-offs, internals) above 85%.
+- **Streaks + accuracy.** A correct-answer streak and lifetime accuracy show up in the quiz intro and in `status` to keep you going.
+- **Offline `review` drill.** `python3 ~/.claude/hooks/pop_quiz.py review [N]` prints flashcards for the topics that are due — pure read of the journal, no model and no network.
 
 > [!NOTE]
 > Your real journal holds your actual answers, so it's **personal and gitignored by
@@ -100,7 +105,12 @@ The hook **checks itself for updates** — no need to remember to `git pull`.
 - When a newer version is found, it appends a **one-line nudge** to its next
   message ("a newer version is available — run `… update`"). You're told **once**
   per new version, not nagged every turn.
-- To upgrade in place:
+- **Hands-off auto-update (opt-in):** set `POP_QUIZ_AUTO_UPDATE=1` and the daily
+  check **self-applies** the new version instead of nudging — it downloads, backs
+  up to `.bak`, atomically replaces the running script in place, and tells you
+  once to reload. It's opt-in by default because auto-running code pulled from the
+  network is a (small, it's your own repo) risk worth choosing deliberately.
+- To upgrade in place manually any time:
 
   ```bash
   python3 ~/.claude/hooks/pop_quiz.py update
@@ -108,8 +118,9 @@ The hook **checks itself for updates** — no need to remember to `git pull`.
 
   This downloads the latest hook from GitHub, **backs up the current one to
   `.bak`**, and overwrites the running script _keeping its installed filename_.
-  Restart Claude Code (or `/hooks`) to load it. Your state, journal, and defer
-  count are untouched.
+  Restart Claude Code (or `/hooks`) to load it. **Updates touch only the script
+  file**, so your state, journal, and defer count are guaranteed untouched (a
+  regression test enforces this).
 
 Check the version and update status any time:
 
@@ -148,6 +159,7 @@ nothing is hard-coded into the script. Every knob is an environment variable:
 | `POP_QUIZ_REPO`                | `jay739/claude-pop-quiz`                 | `owner/repo` the update checker pulls from (set if you forked)                                   |
 | `POP_QUIZ_BRANCH`              | `main`                                   | Branch the update checker pulls from                                                             |
 | `POP_QUIZ_NO_UPDATE_CHECK`     | _(unset)_                                | Set to any value to disable the daily online version check entirely                              |
+| `POP_QUIZ_AUTO_UPDATE`         | _(unset)_                                | Set to any value to auto-apply a newer version on the daily check (else just nudge)              |
 
 ### How to set / change them
 

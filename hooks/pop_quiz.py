@@ -13,7 +13,10 @@ agent calls. Wired to two events with a mode argument:
     tool name and any file paths for context enrichment, and if the learning check
     is LOCKED (defer limit hit), DENY the tool call so no work proceeds until the
     user takes the quiz.
-  - "status" (CLI only): pretty-print current state, counters, and stats.
+  - "status" (CLI only): pretty-print current state, counters, stats, accuracy,
+    and per-topic mastery.
+  - "review" (CLI only): offline flashcard drill of the topics the spaced-
+    repetition system says are due — pure read of the journal, no model/network.
   - "update" (CLI only): self-update — download the latest hook from GitHub and
     overwrite this script in place (keeps its installed filename; backs up .bak).
 
@@ -47,11 +50,16 @@ Configuration (environment variables, all optional):
   POP_QUIZ_BRANCH            branch checked for updates           (default main)
   POP_QUIZ_NO_UPDATE_CHECK   set to any value to disable the daily online
                              version check entirely               (default off)
+  POP_QUIZ_AUTO_UPDATE       set to any value to AUTO-APPLY a newer version on
+                             the daily check (else just nudge)    (default off)
 
 Updates: once a day (on UserPromptSubmit) the hook quietly checks GitHub for a
-newer __version__ and, if found, appends a one-line upgrade nudge to its next
-injected message. The check is throttled, time-boxed, and fully offline-safe —
-any failure is swallowed so the hook never breaks. Run "update" to self-upgrade.
+newer __version__. By default it appends a one-line upgrade nudge; with
+POP_QUIZ_AUTO_UPDATE set it instead self-applies (download, back up to .bak,
+atomic in-place replace) and announces it. Either way the check is throttled,
+time-boxed, and offline-safe, and updates touch ONLY the script file, so the
+defer counter, lock, stats, and journal survive untouched. Run "update" to
+self-upgrade manually at any time.
 
 Portable: state AND the default journal live under <claude-dir>/state/, so
 copying ~/.claude/ to another machine just works — no absolute paths baked in.
@@ -61,9 +69,13 @@ Per-project topics: place a .pop-quiz-topics file in the project root (one topic
 per line, lines starting with # are comments). The hook walks up from cwd to ~
 and injects any found topics into the quiz directive for targeted questions.
 
-Spaced repetition: the grading journal is parsed back on each fire — topics the
-user previously scored partial/missed on are fed into the next quiz so weak
-areas resurface. The same parse powers a lifetime-accuracy line in "status".
+Adaptive + spaced repetition: the grading journal is parsed back on each fire.
+Each topic's verdict history folds into a Leitner box (✅ promotes, ❌ resets,
+🟡 holds); the least-mastered topics are fed into the next quiz so weak areas
+resurface, mastered ones retire. Recent accuracy also tunes question difficulty
+(harder when strong, foundational when struggling), and a correct-answer streak
+is surfaced to motivate. The same parse powers the accuracy + mastery lines in
+"status" and the offline "review" drill.
 
 Robustness: harness-injected prompts (background/terminal task completions,
 [SYSTEM NOTIFICATION] wrappers) pass straight through so they can't be misread
@@ -86,7 +98,7 @@ try:
 except ImportError:
     fcntl = None  # Degraded mode: best-effort, no advisory lock (see _exclusive_lock).
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # e.g. ~/.claude
 STATE_DIR = os.path.join(BASE, "state")
@@ -281,19 +293,88 @@ def _journal_accuracy():
     }
 
 
-def _recent_weak_topics(limit=5):
-    """Most recent topics the user scored partial/missed on (newest-first file)."""
-    topics, seen = [], set()
-    for m in _Q_HEADER.finditer(_read_journal(max_bytes=65536)):
-        if m.group(1) in (_VERDICT_PART, _VERDICT_MISS):
-            topic = m.group(2).strip().strip("`").strip()
-            key = topic.lower()
-            if topic and key not in seen:
-                seen.add(key)
-                topics.append(topic)
-                if len(topics) >= limit:
-                    break
-    return topics
+_ANSWER_LINE = re.compile(r"\*\*Answer:\*\*\s*(.+)")
+
+# Leitner box thresholds: <= DUE means resurface soon; >= MASTERED means retire.
+SRS_DUE = 1
+SRS_MASTERED = 3
+SRS_BOX_MAX = 4
+
+
+def _journal_entries(text=None):
+    """Parse the journal into per-question dicts, NEWEST FIRST. Each is
+    {verdict, title, question, answer}. The block between two ### headers holds
+    the quoted question and the **Answer:** bullet."""
+    text = _read_journal() if text is None else text
+    matches = list(_Q_HEADER.finditer(text))
+    entries = []
+    for i, m in enumerate(matches):
+        block = text[
+            m.end() : (matches[i + 1].start() if i + 1 < len(matches) else len(text))
+        ]
+        question = " ".join(
+            ln.lstrip(">").strip()
+            for ln in block.splitlines()
+            if ln.lstrip().startswith(">")
+        ).strip()
+        am = _ANSWER_LINE.search(block)
+        entries.append(
+            {
+                "verdict": m.group(1),
+                "title": m.group(2).strip().strip("`").strip(),
+                "question": question,
+                "answer": am.group(1).strip() if am else "",
+            }
+        )
+    return entries
+
+
+def _topic_boxes(entries=None):
+    """Fold each topic's verdict history (oldest -> newest) into a Leitner box:
+    ✅ promotes (+1, capped), ❌ resets to 0, 🟡 holds. Keyed by lowercased title.
+    Returns {key: {title, box, seen, last_verdict}}."""
+    entries = _journal_entries() if entries is None else entries
+    boxes = {}
+    for e in reversed(entries):  # oldest first so promotions accumulate
+        title = e["title"]
+        if not title:
+            continue
+        b = boxes.setdefault(
+            title.lower(), {"title": title, "box": 1, "seen": 0, "last_verdict": ""}
+        )
+        b["title"], b["seen"], b["last_verdict"] = title, b["seen"] + 1, e["verdict"]
+        if e["verdict"] == _VERDICT_GOOD:
+            b["box"] = min(SRS_BOX_MAX, b["box"] + 1)
+        elif e["verdict"] == _VERDICT_MISS:
+            b["box"] = 0
+    return boxes
+
+
+def _srs_due_topics(limit=5, boxes=None):
+    """Least-mastered topics first (box <= SRS_DUE), most-seen breaking ties."""
+    boxes = _topic_boxes() if boxes is None else boxes
+    due = sorted(
+        (b for b in boxes.values() if b["box"] <= SRS_DUE),
+        key=lambda b: (b["box"], -b["seen"]),
+    )
+    return [b["title"] for b in due[:limit]]
+
+
+def _mastered_topics(boxes=None):
+    boxes = _topic_boxes() if boxes is None else boxes
+    return [b["title"] for b in boxes.values() if b["box"] >= SRS_MASTERED]
+
+
+def _current_streak(entries=None):
+    """Consecutive most-recent ✅ questions (newest first)."""
+    entries = _journal_entries() if entries is None else entries
+    n = 0
+    for e in entries:
+        if e["verdict"] == _VERDICT_GOOD:
+            n += 1
+        else:
+            break
+    return n
 
 
 # --- directives Claude receives ----------------------------------------------
@@ -348,16 +429,57 @@ def quiz_directive(count, defers, sess):
         if topics
         else ""
     )
-    weak = _recent_weak_topics()
-    weak_hint = (
-        (
-            f"Spaced repetition: the user previously scored partial/missed on "
-            f"{', '.join(weak)} — work AT LEAST ONE question in to revisit a weak "
-            f"area, phrased differently than before. "
+
+    # Adaptive + spaced-repetition signals, all derived from the graded journal.
+    entries = _journal_entries()
+    boxes = _topic_boxes(entries)
+    acc = _journal_accuracy()
+    due = _srs_due_topics(boxes=boxes)
+    mastered = _mastered_topics(boxes)
+    streak = _current_streak(entries)
+
+    diff_hint = ""
+    if acc:
+        if acc["pct"] < 60:
+            diff_hint = (
+                f"The user's recent accuracy is {acc['pct']}% (struggling): favour "
+                "FOUNDATIONAL questions that rebuild core understanding, kept clear "
+                "and not tricky. "
+            )
+        elif acc["pct"] > 85:
+            diff_hint = (
+                f"The user's recent accuracy is {acc['pct']}% (strong): make the "
+                "questions HARDER — edge cases, trade-offs, 'why not the "
+                "alternative', and internals. "
+            )
+        else:
+            diff_hint = f"The user's recent accuracy is {acc['pct']}%. "
+
+    srs_hint = ""
+    if due:
+        srs_hint = (
+            f"Spaced repetition (Leitner): the user is weakest on {', '.join(due)} "
+            "— work AT LEAST ONE of these in, reusing the SAME short topic title as "
+            "before so progress tracks, but rephrasing the question. "
         )
-        if weak
-        else ""
-    )
+    if mastered:
+        srs_hint += (
+            f"They have largely mastered {', '.join(mastered[:6])}; only revisit "
+            "those occasionally. "
+        )
+
+    motiv = ""
+    bits = []
+    if streak >= 3:
+        bits.append(f"a {streak}-question correct streak")
+    if acc and acc["total"] >= 3:
+        bits.append(f"{acc['pct']}% lifetime accuracy")
+    if bits:
+        motiv = (
+            "Open by briefly noting their progress (" + ", ".join(bits) + ") to "
+            "motivate, then begin. "
+        )
+
     return (
         f"MANDATORY {NUM_Q}-QUESTION LEARNING CHECK (auto-fired after {count} "
         "actions — your messages plus Claude's tool/file/agent calls — in this "
@@ -366,7 +488,7 @@ def quiz_directive(count, defers, sess):
         "SUBSTANCE of THIS chat — (a) jargon/terminology used, (b) the scripts or "
         "code written/changed and WHY they work that way, (c) the project files "
         "touched and what each does. Pick the meatiest concepts, NOT conversational "
-        f"trivia. {tools_hint}{topic_hint}{weak_hint}"
+        f"trivia. {motiv}{tools_hint}{topic_hint}{srs_hint}{diff_hint}"
         + _format_clause()
         + pressure
         + "Do NOT grade yet — just present the questions and wait for their reply. "
@@ -390,7 +512,11 @@ def grade_directive(unlocked, seconds):
         f"The user just answered the pending learning check. {took}{unlock_note}"
         "Grade each question now: brief spoken feedback, correct any mistakes, "
         "give a verdict (correct / partial / missed) and 1-2 study links per "
-        "question, and flag real gaps. THEN append the results to the learning "
+        "question, and flag real gaps. For any 🟡 PARTIAL or ❌ MISSED question, "
+        "first offer ONE short hint phrased as a guiding question (a Socratic "
+        "nudge, not the solution) before revealing the full answer — keep it to a "
+        "single nudge, do not wait for a reply or stall the turn. THEN append the "
+        "results to the learning "
         f"journal at {JOURNAL} (create it with a short header + a summary table if "
         "missing). Add a section dated today, NEWEST ENTRY FIRST, with a one-line "
         "topic summary, and render EACH question in this EXACT shape so the entry "
@@ -555,45 +681,38 @@ def _update_precheck(now):
     return _remote_version(), True
 
 
-def _apply_update_check(g, latest, did_fetch, now):
-    """INSIDE the lock: record the check result into global state and return a
-    one-line nudge if a newer version was newly detected (once per new version)."""
-    if did_fetch:
-        g["update_checked_ts"] = now
-        if latest:
-            g["update_latest"] = latest
-    latest = latest or g.get("update_latest")
-    if latest and _parse_version(latest) > _parse_version(__version__):
-        if g.get("update_notified") != latest:
-            g["update_notified"] = latest
-            script = os.path.abspath(__file__)
-            return (
-                f"[pop-quiz] A newer version is available: v{latest} "
-                f"(installed v{__version__}). Tell the user, in one line, to "
-                f"upgrade by running: python3 {script} update"
-            )
-    return ""
+def _do_update(fetch_timeout=10):
+    """Download the latest hook and replace THIS script in place, keeping its
+    filename and backing the current one up to .bak. Returns
+    (applied: bool, latest: str|None, message: str).
 
-
-def cmd_update():
+    Touches ONLY the script file — never the state file — so the defer counter,
+    lock flag, stats, and journal all survive an update untouched. Shared by the
+    manual `update` command and the opt-in auto-updater.
+    """
     target = os.path.abspath(__file__)
-    latest = _remote_version(timeout=5)
+    latest = _remote_version(timeout=min(5, fetch_timeout))
     if latest and _parse_version(latest) <= _parse_version(__version__):
-        print(f"Already up to date (v{__version__}).")
-        return
-    data = _fetch_remote(timeout=10)
+        return False, latest, f"Already up to date (v{__version__})."
+    data = _fetch_remote(timeout=fetch_timeout)
     if not data:
-        print(
-            "Update failed: could not reach GitHub. Check your connection "
-            "(or POP_QUIZ_REPO / POP_QUIZ_BRANCH)."
+        return (
+            False,
+            latest,
+            (
+                "Update failed: could not reach GitHub "
+                "(check your connection, or POP_QUIZ_REPO / POP_QUIZ_BRANCH)."
+            ),
         )
-        return
     # Sanity-check the payload before trusting it over our running script: it
     # must look like a real, reasonably-sized pop_quiz.py, not an error page.
     markers = (b"__version__", b"def main", b"def quiz_directive", b"def classify")
     if len(data) < 4096 or any(m not in data for m in markers):
-        print("Update aborted: the downloaded file does not look like pop_quiz.py.")
-        return
+        return (
+            False,
+            latest,
+            ("Update aborted: the downloaded file does not look like pop_quiz.py."),
+        )
     backup = target + ".bak"
     try:
         if os.path.exists(target):
@@ -605,11 +724,56 @@ def cmd_update():
         os.chmod(tmp, 0o755)
         os.replace(tmp, target)  # atomic; safe to overwrite the running script
     except Exception as e:
-        print(f"Update failed while writing {target}: {e}")
-        return
-    print(f"Updated {os.path.basename(target)}: v{__version__} -> v{latest or '?'}")
-    print(f"Backup of the previous version: {backup}")
-    print("Restart Claude Code (or run /hooks) to load the new version.")
+        return False, latest, f"Update failed while writing {target}: {e}"
+    return (
+        True,
+        latest,
+        (
+            f"Updated {os.path.basename(target)}: v{__version__} -> v{latest or '?'} "
+            f"(backup: {backup})"
+        ),
+    )
+
+
+def _apply_update_check(g, latest, did_fetch, now, auto_applied=None):
+    """INSIDE the lock: record the check result into global state and return a
+    one-line nudge. If `auto_applied` is set (the opt-in auto-updater already
+    swapped the file OUTSIDE the lock), announce that instead of nagging."""
+    if did_fetch:
+        g["update_checked_ts"] = now
+        if latest:
+            g["update_latest"] = latest
+    latest = latest or g.get("update_latest")
+    if auto_applied:
+        g["update_notified"] = auto_applied
+        g["update_applied"] = auto_applied
+        return (
+            f"[pop-quiz] Auto-updated to v{auto_applied} (was v{__version__}). "
+            "Tell the user in one line to restart Claude Code or run /hooks to "
+            "load it; their defer count and journal are unchanged."
+        )
+    if latest and _parse_version(latest) > _parse_version(__version__):
+        if g.get("update_notified") != latest:
+            g["update_notified"] = latest
+            script = os.path.abspath(__file__)
+            hint = (
+                "set POP_QUIZ_AUTO_UPDATE=1 to apply future updates automatically"
+                if not os.environ.get("POP_QUIZ_AUTO_UPDATE")
+                else "it will auto-apply on the next check"
+            )
+            return (
+                f"[pop-quiz] A newer version is available: v{latest} "
+                f"(installed v{__version__}). Tell the user, in one line, to "
+                f"upgrade by running `python3 {script} update` ({hint})."
+            )
+    return ""
+
+
+def cmd_update():
+    applied, latest, msg = _do_update()
+    print(msg)
+    if applied:
+        print("Restart Claude Code (or run /hooks) to load the new version.")
 
 
 # --- status command ----------------------------------------------------------
@@ -664,6 +828,15 @@ def cmd_status():
             f"Accuracy   : {acc['pct']}%   ({acc['correct']} ✅ · {acc['partial']} 🟡 "
             f"· {acc['missed']} ❌ over {acc['total']} graded questions)"
         )
+    boxes = _topic_boxes()
+    if boxes:
+        due = len(_srs_due_topics(limit=10**6, boxes=boxes))
+        mastered = len(_mastered_topics(boxes))
+        print(
+            f"Mastery    : {len(boxes)} topics tracked · {due} due · "
+            f"{mastered} mastered · streak {_current_streak()} ✅   "
+            "(see `review`)"
+        )
     sessions = {
         k: v for k, v in state.items() if k != GLOBAL_KEY and isinstance(v, dict)
     }
@@ -684,6 +857,38 @@ def cmd_status():
         print("\nNo active sessions.")
 
 
+# --- review command ----------------------------------------------------------
+
+
+def cmd_review(n=None):
+    """Offline flashcard drill of the topics the SRS says are due (box <= SRS_DUE).
+    Pure read of the journal — no model, no network. `n` caps how many topics."""
+    entries = _journal_entries()
+    boxes = _topic_boxes(entries)
+    due_keys = {t.lower() for t in _srs_due_topics(limit=10**6, boxes=boxes)}
+    drill, seen = [], set()
+    for e in entries:  # newest first → most recent phrasing per topic
+        key = e["title"].lower()
+        if key in due_keys and key not in seen and e["question"]:
+            seen.add(key)
+            drill.append(e)
+    if n:
+        drill = drill[: int(n)]
+    if not drill:
+        print(
+            "Nothing due for review — the journal is empty, or every tracked "
+            "topic is already mastered. Keep taking quizzes to build it up."
+        )
+        return
+    print(f"=== pop-quiz review · {len(drill)} topic(s) due ===")
+    print("Cover the A: line, recall it, then check.\n")
+    for i, e in enumerate(drill, 1):
+        box = boxes.get(e["title"].lower(), {}).get("box", 0)
+        print(f"{i}. {e['title']}  (box {box}, last verdict {e['verdict']})")
+        print(f"   Q: {e['question']}")
+        print(f"   A: {e['answer'] or '(no answer recorded in the journal)'}\n")
+
+
 # --- main --------------------------------------------------------------------
 
 
@@ -695,6 +900,9 @@ def main():
         return
     if mode == "update":
         cmd_update()
+        return
+    if mode == "review":
+        cmd_review(sys.argv[2] if len(sys.argv) > 2 else None)
         return
 
     payload = {}
@@ -717,8 +925,23 @@ def main():
     # hold the flock during I/O (prompt mode only; tool calls stay fast/silent).
     now = time.time()
     upd_latest = upd_did_fetch = None
+    auto_applied = None
     if mode == "prompt":
         upd_latest, upd_did_fetch = _update_precheck(now)
+        # Opt-in: if POP_QUIZ_AUTO_UPDATE is set and a newer version turned up on
+        # this (throttled, once-a-day) check, apply it now — OUTSIDE the lock,
+        # since it does network I/O and a file write. Writes only the script, so
+        # the defer counter / journal are untouched. Any failure falls back to
+        # the manual upgrade nudge below.
+        if (
+            upd_did_fetch
+            and upd_latest
+            and _parse_version(upd_latest) > _parse_version(__version__)
+            and os.environ.get("POP_QUIZ_AUTO_UPDATE")
+        ):
+            applied, _lat, _msg = _do_update()
+            if applied:
+                auto_applied = upd_latest
 
     with _exclusive_lock():
         state = load()
@@ -740,7 +963,9 @@ def main():
         # message _inject sends this turn.
         if mode == "prompt":
             global _NUDGE
-            _NUDGE = _apply_update_check(g, upd_latest, upd_did_fetch, now)
+            _NUDGE = _apply_update_check(
+                g, upd_latest, upd_did_fetch, now, auto_applied=auto_applied
+            )
 
         # --- PreToolUse: count, collect context, freeze while locked ---------
         if mode == "tool":

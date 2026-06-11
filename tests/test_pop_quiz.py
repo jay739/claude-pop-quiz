@@ -122,16 +122,80 @@ class JournalParsingTests(unittest.TestCase):
             acc, {"correct": 1, "partial": 1, "missed": 1, "total": 3, "pct": 50}
         )
 
-    def test_weak_topics_are_partial_and_missed_only(self):
+    def test_srs_due_topics_are_partial_and_missed_only(self):
+        # One ✅ each promotes nothing here; the 🟡 and ❌ topics stay due (box<=1).
         self.assertEqual(
-            pq._recent_weak_topics(),
-            ["Database index trade-offs", "Connection pooling"],
+            sorted(pq._srs_due_topics()),
+            ["Connection pooling", "Database index trade-offs"],
         )
 
     def test_accuracy_none_when_journal_missing(self):
         pq.JOURNAL = "/nonexistent/path/journal.md"
         self.assertIsNone(pq._journal_accuracy())
-        self.assertEqual(pq._recent_weak_topics(), [])
+        self.assertEqual(pq._srs_due_topics(), [])
+        self.assertEqual(pq._journal_entries(), [])
+
+
+class LeitnerSrsTests(unittest.TestCase):
+    """Verdict history -> Leitner box, driving due/mastered/streak selection."""
+
+    def setUp(self):
+        # Oldest section last (journal is newest-first). Caching: ✅ then ✅ -> box 3
+        # (mastered). Pooling: ✅ then ❌ -> box 0 (due). Newest verdict is Caching ✅.
+        journal = (
+            "# J\n"
+            "## 2026-02-02\n"
+            "### ✅ Q1 · Caching\n> what is caching again?\n"
+            "- **Answer:** reuse stored results.\n"
+            "### ❌ Q2 · Pooling\n> what is pooling?\n"
+            "- **Answer:** reuse warm connections.\n"
+            "## 2026-02-01\n"
+            "### ✅ Q1 · Caching\n> what is caching?\n"
+            "- **Answer:** store results.\n"
+            "### ✅ Q2 · Pooling\n> pooling intro?\n"
+            "- **Answer:** a pool.\n"
+        )
+        self.tmp = tempfile.NamedTemporaryFile(
+            "w", suffix=".md", delete=False, encoding="utf-8"
+        )
+        self.tmp.write(journal)
+        self.tmp.close()
+        self._orig = pq.JOURNAL
+        pq.JOURNAL = self.tmp.name
+
+    def tearDown(self):
+        pq.JOURNAL = self._orig
+        os.unlink(self.tmp.name)
+
+    def test_boxes_promote_on_correct_and_reset_on_miss(self):
+        boxes = pq._topic_boxes()
+        self.assertEqual(boxes["caching"]["box"], 3)
+        self.assertEqual(boxes["pooling"]["box"], 0)
+
+    def test_due_and_mastered_split(self):
+        self.assertEqual(pq._srs_due_topics(), ["Pooling"])
+        self.assertEqual(pq._mastered_topics(), ["Caching"])
+
+    def test_streak_counts_leading_correct_newest_first(self):
+        # Newest entry is Caching ✅; the next is Pooling ❌ -> streak of 1.
+        self.assertEqual(pq._current_streak(), 1)
+
+    def test_entries_carry_question_and_answer(self):
+        first = pq._journal_entries()[0]
+        self.assertEqual(first["title"], "Caching")
+        self.assertEqual(first["verdict"], pq._VERDICT_GOOD)
+        self.assertIn("reuse stored results", first["answer"])
+
+    def test_review_lists_due_topics(self):
+        import io
+        from contextlib import redirect_stdout
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            pq.cmd_review()
+        out = buf.getvalue()
+        self.assertIn("Pooling", out)
+        self.assertNotIn("Caching", out)  # mastered topics are not drilled
 
 
 class EndToEndCycleTests(unittest.TestCase):
@@ -186,6 +250,43 @@ class EndToEndCycleTests(unittest.TestCase):
             "prompt", "1C 2A 3D 4B 5A", POP_QUIZ_MIN="1", POP_QUIZ_MAX="1"
         )
         self.assertIn("answered the pending learning check", grade)
+
+
+class UpdatePreservesStateTests(unittest.TestCase):
+    """An update rewrites ONLY the script file; the defer counter and the rest
+    of state must survive untouched. Regression guard for the user's report that
+    'updating resets the defer flag'. Runs network-free by stubbing the fetch."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        os.makedirs(os.path.join(self.dir, "hooks"))
+        os.makedirs(os.path.join(self.dir, "state"))
+        self.hook = os.path.join(self.dir, "hooks", "pop_quiz.py")
+        shutil.copy(HOOK, self.hook)
+        self.state = os.path.join(self.dir, "state", "pop_quiz_state.json")
+        with open(self.state, "w") as f:
+            json.dump({"_global": {"defers": 3, "locked": True, "stats": {}}}, f)
+        with open(self.state, "rb") as f:
+            self.before = f.read()
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_do_update_leaves_state_untouched(self):
+        # Import the isolated copy so its __file__/STATE_FILE resolve into tmp.
+        spec = importlib.util.spec_from_file_location("pq_update_copy", self.hook)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        with open(self.hook, "rb") as f:
+            payload = f.read()  # a valid pop_quiz.py (all markers, > 4096 bytes)
+        mod._remote_version = lambda timeout=2: "9.9.9"
+        mod._fetch_remote = lambda timeout, max_bytes=0: payload
+        applied, latest, msg = mod._do_update()
+        self.assertTrue(applied, msg)
+        self.assertEqual(latest, "9.9.9")
+        # The state file must be byte-for-byte unchanged -> defers preserved.
+        with open(self.state, "rb") as f:
+            self.assertEqual(f.read(), self.before)
 
 
 if __name__ == "__main__":
