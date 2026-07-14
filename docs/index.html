@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>claude-pop-quiz: Get quizzed on the code your agent wrote</title>
+    <meta name="description" content="Agentic coding lets you ship work without reading it. This hook counters that: every 40 to 45 actions it pauses your Claude Code chat and makes you answer five questions about the session, in your..." />
+    <meta property="og:title" content="claude-pop-quiz: Get quizzed on the code your agent wrote" />
+    <meta property="og:description" content="Agentic coding lets you ship work without reading it. This hook counters that: every 40 to 45 actions it pauses your Claude Code chat and makes you answer five questions about the session, in your..." />
+    <meta property="og:type" content="website" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A//www.w3.org/2000/svg%27%20viewBox%3D%270%200%20100%20100%27%3E%3Ctext%20y%3D%270.9em%27%20font-size%3D%2790%27%3E%F0%9F%8E%93%3C/text%3E%3C/svg%3E" />
+    <style>
+:root {
+  --bg: #0b0f14; --panel: #11161d; --border: #1f2833; --text: #e6edf3;
+  --muted: #93a1b0; --accent: #fb7185; --code-bg: #0d1420;
+  color-scheme: dark light;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f7f9fb; --panel: #ffffff; --border: #dfe6ee; --text: #101826;
+    --muted: #5b6b7c; --code-bg: #f1f5f9;
+  }
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: var(--bg); color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  line-height: 1.6; -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.wrap { max-width: 920px; margin: 0 auto; padding: 0 1.25rem; }
+nav {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 1.1rem 0; font-size: 0.95rem;
+}
+nav .brand { color: var(--muted); font-weight: 600; }
+nav .brand:hover { color: var(--text); text-decoration: none; }
+header.hero { padding: 3.5rem 0 3rem; }
+.pills { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 1.1rem; }
+.pill {
+  font-size: 0.78rem; font-weight: 600; letter-spacing: 0.02em;
+  padding: 0.22rem 0.7rem; border-radius: 999px;
+  border: 1px solid var(--border); color: var(--muted); background: var(--panel);
+}
+.pill.accent { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+h1 { font-size: clamp(2.3rem, 6vw, 3.4rem); line-height: 1.1; letter-spacing: -0.02em; }
+h1 .dot { color: var(--accent); }
+.lead { font-size: clamp(1.15rem, 2.6vw, 1.45rem); font-weight: 500; margin-top: 0.9rem; }
+.desc { color: var(--muted); margin-top: 0.9rem; max-width: 46rem; }
+.actions { display: flex; gap: 0.75rem; flex-wrap: wrap; margin-top: 1.8rem; }
+.btn {
+  display: inline-block; padding: 0.6rem 1.15rem; border-radius: 8px;
+  font-weight: 600; font-size: 0.95rem; border: 1px solid var(--border);
+  background: var(--panel); color: var(--text);
+}
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #0b0f14; }
+.btn:hover { text-decoration: none; filter: brightness(1.1); }
+section { padding: 2.2rem 0; border-top: 1px solid var(--border); }
+section h2 { font-size: 1.35rem; margin-bottom: 1.3rem; letter-spacing: -0.01em; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 0.9rem; }
+.card {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 1.1rem 1.2rem;
+}
+.card h3 { font-size: 1rem; margin-bottom: 0.35rem; }
+.card h3::before { content: "\25AA\FE0E  "; color: var(--accent); }
+.card p { font-size: 0.92rem; color: var(--muted); }
+pre {
+  background: var(--code-bg); border: 1px solid var(--border);
+  border-left: 3px solid var(--accent); border-radius: 8px;
+  padding: 1rem 1.2rem; overflow-x: auto; font-size: 0.9rem; line-height: 1.55;
+}
+code { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }
+.credit {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  padding: 1rem 1.2rem; font-size: 0.92rem; color: var(--muted);
+}
+footer {
+  border-top: 1px solid var(--border); padding: 1.6rem 0 2.4rem;
+  font-size: 0.88rem; color: var(--muted);
+  display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap;
+}
+/* hub */
+.applist { display: grid; grid-template-columns: repeat(auto-fill, minmax(270px, 1fr)); gap: 0.9rem; }
+a.appcard {
+  display: block; background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 1.15rem 1.25rem; color: var(--text);
+}
+a.appcard:hover { text-decoration: none; border-color: var(--card-accent); }
+a.appcard h3 { font-size: 1.05rem; }
+a.appcard h3::before { content: "\25CF  "; color: var(--card-accent); font-size: 0.7em; vertical-align: 2px; }
+a.appcard p { font-size: 0.9rem; color: var(--muted); margin-top: 0.3rem; }
+a.appcard .meta { display: block; margin-top: 0.6rem; font-size: 0.78rem; color: var(--card-accent); font-weight: 600; }
+.appcard.soon { opacity: 0.75; }
+</style>
+  </head>
+  <body>
+    <div class="wrap">
+      <nav>
+        <a class="brand" href="../">apps.jay739.dev</a>
+        <a href="https://github.com/jay739/claude-pop-quiz">GitHub &nearr;</a>
+      </nav>
+      <header class="hero">
+        <div class="pills"><span class="pill accent">Claude Code hook</span><span class="pill">v0.5.1</span></div>
+        <h1>claude-pop-quiz<span class="dot">.</span></h1>
+        <p class="lead">Get quizzed on the code your agent wrote.</p>
+        <p class="desc">Agentic coding lets you ship work without reading it. This hook counters that: every 40 to 45 actions it pauses your Claude Code chat and makes you answer five questions about the session, in your own words, on a cadence you cannot skip. Claude grades you and flags the gaps.</p>
+        <div class="actions">
+          <a class="btn primary" href="https://github.com/jay739/claude-pop-quiz">View on GitHub</a>
+          <a class="btn" href="#quickstart">Quickstart</a>
+        </div>
+      </header>
+      <section>
+        <h2>Features</h2>
+        <div class="grid"><div class="card"><h3>Mandatory cadence</h3><p>Counts your messages plus every tool call. Cross the threshold and the quiz fires before work continues.</p></div><div class="card"><h3>Questions with substance</h3><p>Asks about the jargon used, the code written and why, and the files touched in that actual session.</p></div><div class="card"><h3>Learning journal</h3><p>Every quiz is appended to a markdown revision log with verdicts, context notes and links to study.</p></div><div class="card"><h3>Spaced repetition</h3><p>Leitner boxes: topics you miss keep coming back, topics you nail retire.</p></div><div class="card"><h3>Adaptive difficulty</h3><p>Recent accuracy tunes the questions, from foundational to edge cases and internals.</p></div><div class="card"><h3>Offline review</h3><p>A flashcard drill reads the journal directly. No model, no network.</p></div></div>
+      </section>
+      <section id="quickstart">
+        <h2>Quickstart</h2>
+        <pre><code>git clone https://github.com/jay739/claude-pop-quiz
+cd claude-pop-quiz
+./install.sh</code></pre>
+      </section>
+      
+      <footer>
+        <span>MIT License &middot; &copy; 2026 Jayakrishna Konda</span>
+        <span><a href="../">All apps</a> &middot; <a href="https://github.com/jay739">GitHub</a> &middot; <a href="https://jay739.dev">jay739.dev</a></span>
+      </footer>
+    </div>
+  </body>
+</html>
