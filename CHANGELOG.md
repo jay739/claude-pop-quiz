@@ -3,6 +3,76 @@
 All notable changes to **claude-pop-quiz** are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.2] — The learning loop actually learns
+
+Every fix here addresses the same underlying flaw: this hook was built so that
+all of its failures are silent. The wired command discards stderr, the journal
+is written by a cooperative model rather than by code, and nothing ever checked
+its own output. Three features had been dead or degraded for 37 journal
+sessions with no symptom.
+
+- **Journal parsing recovered 88% of the history it was discarding.** The
+  grading directive's template reads `<✅ correct | 🟡 partial | ❌ missed>
+Q<n>`, and the grader renders that as `### ✅ correct Q1 · topic`, emoji
+  **and** word. The parser allowed no slot for that word, so on a real 283 KB
+  journal it matched **22 of 185** graded questions. Lifetime accuracy,
+  adaptive difficulty, the Leitner boxes and the `review` drill were all
+  reading 12% of the data. Measured accuracy was 45% when the truth was 61%,
+  which is the difference between the hook feeding you deliberately
+  foundational questions and treating you as competent. The header pattern now
+  tolerates the verdict word, `⚠️` as a fourth verdict, h2 to h6, bold
+  headings and looser separators, and the directive pins the shape explicitly.
+- **Spaced repetition can promote a topic at all now.** `quiz_directive` asked
+  the model to reuse an existing topic title, but `grade_directive`, which
+  actually writes the headers, was handed no list of existing titles. So the
+  grader coined a fresh name per question: 173 topics across 185 questions,
+  only 4 ever asked twice, no box ever promoted, `mastered` permanently 0.
+  Grading now receives the tracked titles as a controlled vocabulary with an
+  explicit instruction to reuse them character for character, and topic keys
+  are normalised so near-identical titles share one box (a real journal had
+  split one topic across two boxes over a single stray backtick).
+- **Leitner boxes have a clock.** "Due" was `box <= 1` and nothing else, so a
+  topic answered correctly twice retired forever. Entries are now attributed to
+  their dated section and fall due again after a per-box interval (7 / 21 / 60
+  days), so mastery decays instead of being permanent.
+- **A correct answer can no longer freeze your tools.** The defer classifier
+  treated a long list of opening words as "new work", including `this`, `so`,
+  `yes`, `that's` and the bare modals, which are ordinary ways to begin an
+  essay answer. With `POP_QUIZ_DEFER_LIMIT` set, answering correctly could
+  freeze every chat. The work-instruction list is now deliberately narrow, with
+  questions and bare acknowledgements handled separately, because a false defer
+  costs a freeze while a false answer costs one graded reply.
+- **New `doctor` command.** Reports journal parse coverage, unreadable
+  headings, topic-reuse rate, duplicate hook wiring, the update channel and the
+  last swallowed traceback. Exits non-zero so it can run from CI or a cron.
+  This is the systemic fix: the bugs above were all invisible, and coverage
+  would have been a number on a screen on day one.
+- **Crashes are recorded instead of vanishing.** Any unhandled exception is
+  appended to `state/pop_quiz_errors.log` and surfaced by `status` and
+  `doctor`. The hook still exits 0 so it can never break your turn.
+- **Updates track tagged releases, not a branch tip** (`POP_QUIZ_CHANNEL`,
+  default `release`). With auto-update on, tracking a branch meant any merge
+  self-applied to every machine within a day. The download is also
+  **byte-compiled before it replaces the running script**, so a syntactically
+  broken release cannot silently take the quiz down everywhere.
+- **`JOURNAL_MAX_ENTRIES` works.** It told the model to trim `## 📅 ...`
+  headers; real journals contain `## <date> · <topic>` and zero 📅, so the cap
+  silently trimmed nothing.
+- **The installer no longer double-wires a renamed install.** It matched the
+  literal string `pop_quiz.py`, so an install renamed to e.g.
+  `grill_reminder.py` (which the README blesses and `update` preserves) was
+  invisible: re-running appended a _second_ hook, both ran, and the action
+  counter double-counted. `install.sh` now finds an existing install under any
+  name, upgrades it in place, and carries forward every knob already baked into
+  the command. `uninstall.sh` had the same blindness and used to report success
+  while leaving the hooks wired.
+- **CI** gained a lint job (`black`, plus shell syntax checks) and a
+  format-conformance step that runs `doctor` against `JOURNAL.example.md`, so
+  the documented journal shape can never drift from the parser again. Actions
+  bumped to `checkout@v7` / `setup-python@v7`, off Node 20.
+- Tests: 23 to 57, with each new case verified to fail against 0.5.1.
+- New env var: `POP_QUIZ_CHANNEL`.
+
 ## [0.5.1] — Freeze-bypass fix
 
 - **The freeze is a real backstop again.** While locked, only an actual one-line

@@ -9,7 +9,7 @@ _Stay fluent in the code your agent wrote: get pop-quizzed on your own sessions,
 [![version](https://img.shields.io/github/v/tag/jay739/claude-pop-quiz?label=version&sort=semver&color=brightgreen)](https://github.com/jay739/claude-pop-quiz/releases)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![python](https://img.shields.io/badge/python-3.6%2B-blue.svg)](https://www.python.org/)
-[![changelog](https://img.shields.io/badge/changelog-v0.5.1-orange.svg)](CHANGELOG.md)
+[![changelog](https://img.shields.io/badge/changelog-v0.5.2-orange.svg)](CHANGELOG.md)
 
 [**Install**](#install) · [**How it works**](#how-it-works) · [**Configuration**](#configuration) · [**Updates**](#staying-up-to-date) · [**Changelog**](CHANGELOG.md)
 
@@ -23,9 +23,11 @@ Every ~40 to 45 _actions_ in a chat (your messages **plus** every tool/file/agen
 
 After grading, Claude appends the results to a **learning journal**, a markdown revision log of every quiz: each question, your answer, the correct answer, a verdict, a one-line **context** note (the file or concept the question came from, so the entry stands alone months later), and links to study. Re-read it later, or point it at a git repo to version your progress. See [`JOURNAL.example.md`](JOURNAL.example.md) for the format.
 
+That journal's layout is a **contract**, not decoration: the hook parses it back to drive everything below, keyed on each entry's `### <verdict emoji> Q<n> · <topic title>` header and its topic title. If the grader drifts off that shape, or renames a topic, the affected history goes quiet. [`doctor`](#when-something-seems-off-doctor) reports the parse coverage so drift shows up as a number instead of rotting unnoticed.
+
 That journal is also read **back in** to make each round smarter:
 
-- **Leitner spaced repetition.** Every topic's verdict history folds into a box: a correct answer promotes it, a miss resets it, a partial holds. The next quiz pulls your least-mastered topics and retires the ones you've nailed, so weak areas keep coming back until they stick.
+- **Leitner spaced repetition.** Every topic's verdict history folds into a box: a correct answer promotes it, a miss resets it, a partial holds. The next quiz pulls your least-mastered topics, so weak areas keep coming back until they stick. Boxes are also **time-based**: a topic you have nailed rests for a while (a week in box 2, three weeks in box 3, two months in box 4) and then falls due again, so "mastered" means "known", not "never asked again".
 - **Adaptive difficulty.** Your recent accuracy tunes the questions: foundational when you're below 60%, harder (edge cases, trade-offs, internals) above 85%.
 - **Streaks and accuracy.** A correct-answer streak and lifetime accuracy show up in the quiz intro and in `status` to keep you going.
 - **Offline `review` drill.** `python3 ~/.claude/hooks/pop_quiz.py review [N]` prints flashcards for the topics that are due. Pure read of the journal, no model and no network.
@@ -55,7 +57,7 @@ Design choices worth knowing:
 ## Install
 
 ```bash
-git clone https://github.com/<you>/claude-pop-quiz.git
+git clone https://github.com/jay739/claude-pop-quiz.git
 cd claude-pop-quiz
 ./install.sh
 ```
@@ -102,6 +104,15 @@ The hook **checks itself for updates**, so there is no need to remember to `git 
   newer `__version__` exists. The check is throttled to once per 24h, time-boxed
   to ~2s, and **fully offline-safe**: any failure is swallowed so the hook never
   breaks or slows you down. Tool calls never hit the network.
+- **Updates come from the latest tagged release, not from a branch tip.** With
+  auto-update on, tracking a branch means every commit merged to it self-applies
+  to every machine within a day, so one bad merge disables the hook everywhere
+  with no symptom. A release tag makes shipping an update a deliberate act. Set
+  `POP_QUIZ_CHANNEL=branch` if you want the bleeding edge instead. If the repo
+  has no releases yet, it falls back to the branch and says so in `status` and
+  `doctor`, so the fallback is never invisible.
+- Before replacing itself the hook **compiles the download**. A syntactically
+  broken update would otherwise take the quiz down silently on every machine.
 - When a newer version is found, it appends a **one-line nudge** to its next
   message ("a newer version is available, run `... update`"). You're told **once**
   per new version, not nagged every turn.
@@ -160,6 +171,7 @@ nothing is hard-coded into the script. Every knob is an environment variable:
 | `POP_QUIZ_BRANCH`              | `main`                                   | Branch the update checker pulls from                                                             |
 | `POP_QUIZ_NO_UPDATE_CHECK`     | _(unset)_                                | Set to any value to disable the daily online version check entirely                              |
 | `POP_QUIZ_AUTO_UPDATE`         | _(unset)_                                | Set to any value to auto-apply a newer version on the daily check (else just nudge)              |
+| `POP_QUIZ_CHANNEL`             | `release`                                | Where updates come from: `release` tracks the latest tagged release, `branch` tracks the branch tip |
 
 ### How to set / change them
 
@@ -189,6 +201,25 @@ python3 ~/.claude/hooks/pop_quiz.py status
 ```
 
 This prints the active sessions, action counts, defer tally, lock state, and lifetime quiz stats.
+
+### When something seems off: `doctor`
+
+```bash
+python3 ~/.claude/hooks/pop_quiz.py doctor
+```
+
+Every failure in this hook is silent by design. The wired command ends in
+`2>/dev/null || true` so a crash can never break your turn, the journal is
+written by a cooperative model rather than by code, and the parse that feeds
+spaced repetition can degrade without a single visible symptom. `doctor` is the
+counterweight: it prints journal **parse coverage** (records found versus
+records the hook can actually read), any headings it had to skip, how often
+topic titles are being reused, duplicate hook wiring, the update channel in
+use, and the last swallowed traceback. It exits non-zero when something needs
+attention, so you can run it from CI or a cron.
+
+Run it first whenever quizzes seem to have stopped firing, or whenever your
+accuracy or mastery numbers look implausible.
 
 Common tweaks:
 
