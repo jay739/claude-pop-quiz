@@ -742,5 +742,64 @@ class ErrorVisibilityTests(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
 
+class WiredConfigDiscoveryTests(unittest.TestCase):
+    """Config is baked into the hook command in settings.json, not exported into
+    the shell, so a bare `doctor` has to read it back out of the wiring. It
+    otherwise inspects the DEFAULT journal and reports 0 records on a perfectly
+    healthy install."""
+
+    WIRED = {
+        "UserPromptSubmit": [
+            "POP_QUIZ_FORMAT=mixed POP_QUIZ_DEFER_LIMIT=5 "
+            "POP_QUIZ_JOURNAL=/home/me/notes/JOURNAL.md POP_QUIZ_AUTO_UPDATE=1 "
+            "python3 ~/.claude/hooks/grill_reminder.py prompt 2>/dev/null || true"
+        ],
+        "PreToolUse": ["POP_QUIZ_DEFER_LIMIT=5 python3 x.py tool"],
+    }
+
+    def test_reads_a_value_from_the_wired_command(self):
+        self.assertEqual(
+            pq._wired_env("POP_QUIZ_JOURNAL", self.WIRED), "/home/me/notes/JOURNAL.md"
+        )
+        self.assertEqual(pq._wired_env("POP_QUIZ_FORMAT", self.WIRED), "mixed")
+
+    def test_quoted_values_are_unwrapped(self):
+        wired = {"PreToolUse": ['POP_QUIZ_JOURNAL="/a path/J.md" python3 x.py tool']}
+        self.assertEqual(pq._wired_env("POP_QUIZ_JOURNAL", wired), "/a path/J.md")
+
+    def test_missing_value_is_empty(self):
+        self.assertEqual(pq._wired_env("POP_QUIZ_CHANNEL", self.WIRED), "")
+        self.assertEqual(pq._wired_env("POP_QUIZ_JOURNAL", {}), "")
+
+    def test_doctor_reports_on_the_wired_journal(self):
+        tmp = tempfile.NamedTemporaryFile(
+            "w", suffix=".md", delete=False, encoding="utf-8"
+        )
+        tmp.write(
+            f"# J\n## {_d(0)} · s\n### \u2705 Q1 \u00b7 Alpha\n> q\n"
+            "- **You said:** a\n- **Answer:** b\n"
+        )
+        tmp.close()
+        orig_journal, orig_wired = pq.JOURNAL, pq._wired_hooks
+        try:
+            pq.JOURNAL = "/nonexistent/default/journal.md"
+            pq._wired_hooks = lambda: {
+                "PreToolUse": [f"POP_QUIZ_JOURNAL={tmp.name} python3 x.py tool"]
+            }
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = pq.cmd_doctor()
+            out = buf.getvalue()
+            self.assertIn(tmp.name, out)
+            self.assertIn("as configured in the wired hook command", out)
+            self.assertIn("COVERAGE        : 100%", out)
+            self.assertEqual(code, 0, out)
+            # The global must be restored, since the hook keeps running after.
+            self.assertEqual(pq.JOURNAL, "/nonexistent/default/journal.md")
+        finally:
+            pq.JOURNAL, pq._wired_hooks = orig_journal, orig_wired
+            os.unlink(tmp.name)
+
+
 if __name__ == "__main__":
     unittest.main()

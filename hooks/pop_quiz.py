@@ -1311,6 +1311,24 @@ def _wired_hooks():
     return found
 
 
+def _wired_env(var, wired=None):
+    """Read a POP_QUIZ_* value out of the wired hook command.
+
+    Config is baked into the command in settings.json, not exported into the
+    shell, so a bare `doctor` would otherwise inspect the DEFAULT journal while
+    the hook is busy writing somewhere else entirely, and report 0 records on a
+    perfectly healthy install.
+    """
+    wired = _wired_hooks() if wired is None else wired
+    pattern = re.compile(r"\b" + re.escape(var) + r'=("[^"]*"|\S+)')
+    for cmds in wired.values():
+        for cmd in cmds:
+            m = pattern.search(cmd)
+            if m:
+                return m.group(1).strip('"')
+    return ""
+
+
 def cmd_doctor():
     """Self-check. Prints what is healthy, what is broken, and exits non-zero if
     anything needs attention, so it can run from CI or a cron.
@@ -1327,9 +1345,29 @@ def cmd_doctor():
     print(f"Version    : {__version__}")
     print(f"Script     : {os.path.abspath(__file__)}")
 
+    # Report on the journal the HOOK uses, not the one this shell happens to
+    # point at. Env wins when set explicitly; otherwise take what is baked into
+    # the wired command.
+    wired = _wired_hooks()
+    global JOURNAL
+    journal_was = JOURNAL
+    from_wiring = ""
+    if not os.environ.get("POP_QUIZ_JOURNAL"):
+        from_wiring = _wired_env("POP_QUIZ_JOURNAL", wired)
+        if from_wiring:
+            JOURNAL = os.path.expanduser(os.path.expandvars(from_wiring))
+    try:
+        return _doctor_report(problems, warnings, wired, bool(from_wiring))
+    finally:
+        JOURNAL = journal_was
+
+
+def _doctor_report(problems, warnings, wired, from_wiring):
     # --- journal parse coverage ---
     text = _read_journal()
     print(f"\nJournal    : {JOURNAL}")
+    if from_wiring:
+        print("  (as configured in the wired hook command)")
     if not text:
         warnings.append(
             "The journal is empty or unreadable, so there is no history to "
@@ -1417,7 +1455,6 @@ def cmd_doctor():
                 )
 
     # --- wiring ---
-    wired = _wired_hooks()
     print("\nWiring     :", f"{sum(len(v) for v in wired.values())} hook command(s)")
     mine = os.path.basename(os.path.abspath(__file__))
     for event in ("UserPromptSubmit", "PreToolUse"):
