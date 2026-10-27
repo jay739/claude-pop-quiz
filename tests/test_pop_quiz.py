@@ -12,6 +12,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -21,6 +22,15 @@ from contextlib import redirect_stdout
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HOOK = os.path.join(ROOT, "hooks", "pop_quiz.py")
+
+
+def _bump(payload, version=b"9.9.9"):
+    """A payload that looks like a NEWER release. _do_update now reads the
+    version out of the bytes it is about to install, so a test payload carrying
+    the running version is correctly refused as already up to date."""
+    return re.sub(
+        rb'__version__ = "[^"]+"', b'__version__ = "' + version + b'"', payload
+    )
 
 
 def _d(days_ago=0):
@@ -311,11 +321,13 @@ class UpdatePreservesStateTests(unittest.TestCase):
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         with open(self.hook, "rb") as f:
-            payload = f.read()  # a valid pop_quiz.py (all markers, > 4096 bytes)
+            payload = _bump(f.read())  # a valid, NEWER pop_quiz.py
+        mod._PAYLOAD_CACHE.clear()
         mod._remote_version = lambda timeout=2: "9.9.9"
         mod._fetch_remote = lambda timeout, max_bytes=0: payload
         applied, latest, msg = mod._do_update()
         self.assertTrue(applied, msg)
+        # The version now comes from the installed bytes, not a second request.
         self.assertEqual(latest, "9.9.9")
         # The state file must be byte-for-byte unchanged -> defers preserved.
         with open(self.state, "rb") as f:
@@ -673,12 +685,13 @@ class UpdateRejectsBrokenPayloadTests(unittest.TestCase):
         shutil.rmtree(self.dir, ignore_errors=True)
 
     def _attempt(self, payload):
+        self.mod._PAYLOAD_CACHE.clear()
         self.mod._remote_version = lambda timeout=2: "9.9.9"
         self.mod._fetch_remote = lambda timeout, max_bytes=0: payload
         return self.mod._do_update()
 
     def test_non_compiling_payload_is_rejected(self):
-        broken = self.original.replace(b"def main():", b"def main(:")
+        broken = _bump(self.original).replace(b"def main():", b"def main(:")
         applied, _latest, msg = self._attempt(broken)
         self.assertFalse(applied)
         self.assertIn("does not compile", msg)
@@ -692,8 +705,17 @@ class UpdateRejectsBrokenPayloadTests(unittest.TestCase):
         self.assertIn("does not look like pop_quiz.py", msg)
 
     def test_valid_payload_still_applies(self):
-        applied, _latest, msg = self._attempt(self.original)
+        applied, latest, msg = self._attempt(_bump(self.original))
         self.assertTrue(applied, msg)
+        self.assertEqual(latest, "9.9.9")
+
+    def test_same_version_payload_is_refused_as_up_to_date(self):
+        # The guard that the broken version probe used to bypass entirely,
+        # which is why `update` overwrote the running script on every call.
+        applied, latest, msg = self._attempt(self.original)
+        self.assertFalse(applied)
+        self.assertIn("Already up to date", msg)
+        self.assertEqual(latest, pq.__version__)
 
 
 class ErrorVisibilityTests(unittest.TestCase):
@@ -799,6 +821,77 @@ class WiredConfigDiscoveryTests(unittest.TestCase):
         finally:
             pq.JOURNAL, pq._wired_hooks = orig_journal, orig_wired
             os.unlink(tmp.name)
+
+
+class VersionProbeTests(unittest.TestCase):
+    """The version probe must not depend on where __version__ sits in the file.
+
+    It read only the first 4096 bytes. That worked until the module docstring
+    grew past it in v0.4.0, pushing __version__ to offset 4671, and from then
+    until v0.5.3 the probe returned None for EVERY version: the daily check
+    never found an update, the nudge never appeared, and POP_QUIZ_AUTO_UPDATE
+    was a silent no-op. Nothing failed, nothing logged, it simply stopped
+    working because a comment got longer.
+    """
+
+    def setUp(self):
+        pq._PAYLOAD_CACHE.clear()
+
+    def tearDown(self):
+        pq._PAYLOAD_CACHE.clear()
+
+    def test_version_found_far_into_a_large_file(self):
+        payload = (
+            b'"""' + (b"docstring padding. " * 3000) + b'"""\n'
+            b'__version__ = "9.9.9"\n'
+        )
+        self.assertGreater(payload.find(b"__version__"), 4096)
+        self.assertEqual(pq._version_of(payload), "9.9.9")
+
+    def test_probe_reads_the_whole_file_not_a_window(self):
+        payload = b'"""' + (b"x" * 20000) + b'"""\n__version__ = "1.2.3"\n'
+        seen = {}
+
+        def fake_fetch(timeout, max_bytes=0):
+            seen["max_bytes"] = max_bytes
+            return payload[:max_bytes] if max_bytes else payload
+
+        orig = pq._fetch_remote
+        try:
+            pq._fetch_remote = fake_fetch
+            self.assertEqual(pq._remote_version(), "1.2.3")
+        finally:
+            pq._fetch_remote = orig
+        # A truncating read is exactly what broke this for four releases.
+        self.assertFalse(seen["max_bytes"], "probe must not truncate the fetch")
+
+    def test_this_repos_own_hook_is_probeable(self):
+        # Guards the real file: if the docstring grows again, this still passes,
+        # because the probe no longer has a window to outgrow.
+        with open(HOOK, "rb") as f:
+            data = f.read()
+        self.assertEqual(pq._version_of(data), pq.__version__)
+
+    def test_missing_version_is_none_not_a_crash(self):
+        self.assertIsNone(pq._version_of(b"print('no version here')\n"))
+        self.assertIsNone(pq._version_of(None))
+
+    def test_payload_is_fetched_once_per_process(self):
+        calls = []
+
+        def fake_fetch(timeout, max_bytes=0):
+            calls.append(timeout)
+            return b'__version__ = "2.0.0"\n'
+
+        orig = pq._fetch_remote
+        try:
+            pq._fetch_remote = fake_fetch
+            pq._remote_version()
+            pq._remote_version()
+            pq._fetch_whole(timeout=9)
+        finally:
+            pq._fetch_remote = orig
+        self.assertEqual(len(calls), 1, "the version check should not refetch")
 
 
 if __name__ == "__main__":

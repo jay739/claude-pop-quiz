@@ -9,7 +9,7 @@ _Stay fluent in the code your agent wrote: get pop-quizzed on your own sessions,
 [![version](https://img.shields.io/github/v/tag/jay739/claude-pop-quiz?label=version&sort=semver&color=brightgreen)](https://github.com/jay739/claude-pop-quiz/releases)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![python](https://img.shields.io/badge/python-3.6%2B-blue.svg)](https://www.python.org/)
-[![changelog](https://img.shields.io/badge/changelog-v0.5.2-orange.svg)](CHANGELOG.md)
+[![changelog](https://img.shields.io/badge/changelog-v0.5.3-orange.svg)](CHANGELOG.md)
 
 [**Install**](#install) · [**How it works**](#how-it-works) · [**Configuration**](#configuration) · [**Updates**](#staying-up-to-date) · [**Changelog**](CHANGELOG.md)
 
@@ -214,8 +214,11 @@ written by a cooperative model rather than by code, and the parse that feeds
 spaced repetition can degrade without a single visible symptom. `doctor` is the
 counterweight: it prints journal **parse coverage** (records found versus
 records the hook can actually read), any headings it had to skip, how often
-topic titles are being reused, duplicate hook wiring, the update channel in
-use, and the last swallowed traceback. It exits non-zero when something needs
+topic titles are being reused, duplicate hook wiring, and the last swallowed
+traceback. It also **exercises the update path** rather than just naming it,
+fetching the remote hook and reporting its version, because a version check
+that silently returns nothing is precisely how auto-update sat dead from 0.4.0
+to 0.5.2. It exits non-zero when something needs
 attention, so you can run it from CI or a cron.
 
 Run it first whenever quizzes seem to have stopped firing, or whenever your

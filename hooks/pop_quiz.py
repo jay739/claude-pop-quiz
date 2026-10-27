@@ -113,7 +113,7 @@ try:
 except ImportError:
     fcntl = None  # Degraded mode: best-effort, no advisory lock (see _exclusive_lock).
 
-__version__ = "0.5.2"
+__version__ = "0.5.3"
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # e.g. ~/.claude
 STATE_DIR = os.path.join(BASE, "state")
@@ -1057,12 +1057,37 @@ def _fetch_remote(timeout, max_bytes=0):
         return None
 
 
-def _remote_version(timeout=2):
-    head = _fetch_remote(timeout, max_bytes=4096)
-    if not head:
+# Whole payloads fetched this process, so the version check and the update that
+# follows it do not pull the same file twice.
+_PAYLOAD_CACHE = {}
+
+
+def _fetch_whole(timeout):
+    if "data" not in _PAYLOAD_CACHE:
+        _PAYLOAD_CACHE["data"] = _fetch_remote(timeout)
+    return _PAYLOAD_CACHE["data"]
+
+
+def _version_of(data):
+    """Pull __version__ out of a pop_quiz.py payload."""
+    if not data:
         return None
-    m = re.search(rb'__version__\s*=\s*["\']([^"\']+)["\']', head)
+    m = re.search(rb'__version__\s*=\s*["\']([^"\']+)["\']', data)
     return m.group(1).decode() if m else None
+
+
+def _remote_version(timeout=2):
+    """The remote __version__, or None if it could not be determined.
+
+    This reads the WHOLE file rather than a byte window. It used to read only
+    the first 4096 bytes, which worked until the module docstring grew past that
+    in v0.4.0 and pushed __version__ to offset 4671. From then until v0.5.3 this
+    returned None for every single version, so the daily check never found an
+    update, the nudge never appeared, and POP_QUIZ_AUTO_UPDATE was a silent
+    no-op for months. A cheap truncated read is not worth a feature that fails
+    invisibly whenever a comment is added.
+    """
+    return _version_of(_fetch_whole(timeout))
 
 
 def _update_precheck(now):
@@ -1087,10 +1112,15 @@ def _do_update(fetch_timeout=10):
     manual `update` command and the opt-in auto-updater.
     """
     target = os.path.abspath(__file__)
-    latest = _remote_version(timeout=min(5, fetch_timeout))
+    data = _fetch_whole(timeout=fetch_timeout)
+    # Read the version out of the very bytes about to be installed, rather than
+    # from a separate request. A mismatch between the two reads is how this
+    # reported "v0.5.2 -> v?" and overwrote the running script on every call:
+    # the version probe came back None, so the up-to-date guard below was
+    # skipped entirely.
+    latest = _version_of(data)
     if latest and _parse_version(latest) <= _parse_version(__version__):
         return False, latest, f"Already up to date (v{__version__})."
-    data = _fetch_remote(timeout=fetch_timeout)
     if not data:
         return (
             False,
@@ -1483,7 +1513,37 @@ def _doctor_report(problems, warnings, wired, from_wiring):
             )
 
     # --- update channel + swallowed errors ---
+    # Actively PROVE the version probe works rather than just naming the
+    # channel. The probe silently returned None from v0.4.0 to v0.5.3 because
+    # __version__ sat past a 4096-byte read window, so the daily check never
+    # found an update and POP_QUIZ_AUTO_UPDATE was a no-op for months. Printing
+    # the channel would not have caught that; fetching does.
     print(f"\nUpdates    : channel {_ref_note() or 'unknown'}")
+    if os.environ.get("POP_QUIZ_NO_UPDATE_CHECK"):
+        print("  probe           : skipped (POP_QUIZ_NO_UPDATE_CHECK is set)")
+    else:
+        payload = _fetch_whole(timeout=5)
+        if payload is None:
+            warnings.append(
+                "Could not reach GitHub, so the update path could not be "
+                "verified. Expected if this machine is offline."
+            )
+            print("  probe           : unreachable")
+        else:
+            remote = _version_of(payload)
+            if not remote:
+                problems.append(
+                    "The update check can fetch the remote hook but cannot find "
+                    "a __version__ in it, so it can never detect a new release "
+                    "and auto-update is a silent no-op."
+                )
+                print("  probe           : FETCHED but no __version__ found")
+            else:
+                newer = _parse_version(remote) > _parse_version(__version__)
+                print(
+                    f"  probe           : ok, remote v{remote}"
+                    + (" (newer, run `update`)" if newer else " (up to date)")
+                )
     err = _last_error()
     if err:
         print(f"Last error : {err[0]}\n             {err[1][:100]}")

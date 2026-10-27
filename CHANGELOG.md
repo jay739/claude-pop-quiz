@@ -3,6 +3,37 @@
 All notable changes to **claude-pop-quiz** are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.3] — The update checker had been dead since 0.4.0
+
+Same family as 0.5.2, found by actually exercising the release channel instead
+of reading it: another feature that stopped working and said nothing.
+
+- **The version probe read only the first 4096 bytes of the remote file.** That
+  was fine until the module docstring grew past that in **v0.4.0**, pushing
+  `__version__` to offset 4671. From 0.4.0 through 0.5.2 the probe returned
+  `None` for **every** version, so the daily check never found an update, the
+  upgrade nudge never appeared once, and `POP_QUIZ_AUTO_UPDATE=1` was a silent
+  no-op for four releases. Nothing failed and nothing logged; it simply stopped
+  working because a comment got longer. The probe now reads the whole file,
+  which is a few tens of KB once a day.
+- **`update` no longer overwrites the running script on every call.** With the
+  probe returning `None`, the "already up to date" guard was skipped, so each
+  run re-downloaded and replaced the script and reported the nonsensical
+  `v0.5.2 -> v?`. The version is now read from the very bytes about to be
+  installed, so the guard cannot be bypassed and the reported version cannot
+  disagree with what gets written.
+- **`doctor` now proves the update path works** rather than just naming the
+  channel: it fetches, extracts the remote version and reports it, flagging a
+  problem when the file is reachable but carries no parseable version. Naming
+  the channel would never have caught this. An unreachable host stays a note,
+  not a problem, so offline machines do not cry wolf.
+- The payload is fetched at most once per process, so the version check and the
+  update that follows it no longer pull the same file twice.
+- Tests 61 to 67. The three pre-existing update tests had been passing only
+  because they stubbed the probe to return a fake newer version, which hid the
+  bug; they now model a real upgrade, and a new `VersionProbeTests` pins the
+  offset problem directly.
+
 ## [0.5.2] — The learning loop actually learns
 
 Every fix here addresses the same underlying flaw: this hook was built so that
