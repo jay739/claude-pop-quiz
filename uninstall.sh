@@ -9,6 +9,38 @@ CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
 HOOK_DST="$CLAUDE_DIR/hooks/pop_quiz.py"
 SETTINGS="$CLAUDE_DIR/settings.json"
 
+# Locate the hook the way install.sh does, so a RENAMED install is still found.
+# Matching only "pop_quiz.py" meant uninstalling a renamed install reported
+# success while leaving both the script and its wiring in place.
+EXISTING="$(
+    python3 - "$SETTINGS" <<'PY'
+import json, os, re, sys
+
+try:
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+except Exception:
+    sys.exit(0)
+
+MARKERS = ("pop_quiz", "grill_reminder", "POP_QUIZ_")
+for groups in (cfg.get("hooks") or {}).values():
+    for group in groups or []:
+        for h in (group or {}).get("hooks", []):
+            cmd = (h or {}).get("command", "")
+            if not any(m in cmd for m in MARKERS):
+                continue
+            m = re.search(r"(\S+\.py)\s+(?:prompt|tool)\b", cmd)
+            if m:
+                path = os.path.expanduser(os.path.expandvars(m.group(1)))
+                if os.path.isfile(path):
+                    print(path)
+                    sys.exit(0)
+PY
+)"
+if [ -n "$EXISTING" ]; then
+    HOOK_DST="$EXISTING"
+fi
+
 # Remove the hook script.
 if [ -f "$HOOK_DST" ]; then
     rm "$HOOK_DST"
@@ -17,7 +49,7 @@ else
     echo "Hook not found at $HOOK_DST (already removed?)"
 fi
 
-# Strip the two pop_quiz hook entries from settings.json.
+# Strip the pop-quiz hook entries from settings.json.
 if [ -f "$SETTINGS" ]; then
     python3 - "$SETTINGS" <<'PY'
 import json, sys
@@ -30,12 +62,13 @@ except Exception as e:
     sys.exit(1)
 
 hooks = cfg.get("hooks", {})
+MARKERS = ("pop_quiz", "grill_reminder", "POP_QUIZ_")
 changed = False
 for event in list(hooks.keys()):
     new_groups = []
     for group in hooks[event]:
         kept = [h for h in group.get("hooks", [])
-                if "pop_quiz.py" not in h.get("command", "")]
+                if not any(m in h.get("command", "") for m in MARKERS)]
         if len(kept) != len(group.get("hooks", [])):
             changed = True
         if kept:

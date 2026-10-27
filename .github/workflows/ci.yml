@@ -15,7 +15,7 @@ jobs:
     outputs:
       code: ${{ steps.diff.outputs.code }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - id: diff
@@ -45,6 +45,26 @@ jobs:
             echo "code=false" >> "$GITHUB_OUTPUT"
           fi
 
+  lint:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      # Pinned to the version used locally: an unpinned formatter turns an
+      # upstream style change into a red build on an unrelated commit.
+      - name: Install black
+        run: pip install "black==26.5.1"
+      - name: Check formatting
+        run: black --check --diff hooks/ tests/
+      - name: Shell syntax
+        run: bash -n install.sh && bash -n uninstall.sh
+
   test:
     needs: changes
     if: needs.changes.outputs.code == 'true'
@@ -56,28 +76,41 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         python-version: ["3.8", "3.12"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
       - name: Byte-compile the hook
         run: python -m py_compile hooks/pop_quiz.py
       - name: Run tests
         run: python -m unittest discover -s tests -v
+      # The journal format is a contract between the grading directive and the
+      # parser, and it is written by a model rather than by code. Running the
+      # self-check against the shipped example proves the documented format is
+      # still fully parseable, which is exactly what silently stopped being
+      # true before 0.5.2.
+      - name: Self-check the documented journal format
+        shell: bash
+        env:
+          POP_QUIZ_JOURNAL: JOURNAL.example.md
+          POP_QUIZ_NO_UPDATE_CHECK: "1"
+        run: python hooks/pop_quiz.py doctor
 
   # Single required check for the test matrix. A skipped matrix job reports
   # one check under its unexpanded name, which never satisfies per-entry
   # required checks, so branch protection requires ci-ok instead.
   ci-ok:
-    needs: [changes, test]
+    needs: [changes, lint, test]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Fail if test failed or was cancelled
+      - name: Fail if any job failed or was cancelled
         run: |
-          echo "test: ${{ needs.test.result }}"
-          case "${{ needs.test.result }}" in
-            success|skipped) exit 0 ;;
-            *) exit 1 ;;
-          esac
+          echo "lint: ${{ needs.lint.result }}  test: ${{ needs.test.result }}"
+          for r in "${{ needs.lint.result }}" "${{ needs.test.result }}"; do
+            case "$r" in
+              success|skipped) ;;
+              *) exit 1 ;;
+            esac
+          done

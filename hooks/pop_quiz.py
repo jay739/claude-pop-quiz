@@ -17,6 +17,11 @@ agent calls. Wired to two events with a mode argument:
     and per-topic mastery.
   - "review" (CLI only): offline flashcard drill of the topics the spaced-
     repetition system says are due — pure read of the journal, no model/network.
+  - "doctor" (CLI only): self-check. Reports journal parse COVERAGE (records
+    found vs parsed), unrecognised headers, topic-vocabulary health, duplicate
+    hook wiring, and the last swallowed error. Exits non-zero if anything is
+    wrong, so it can be run from CI or a cron. Run this first when the hook
+    seems to have stopped working.
   - "update" (CLI only): self-update — download the latest hook from GitHub and
     overwrite this script in place (keeps its installed filename; backs up .bak).
 
@@ -52,6 +57,10 @@ Configuration (environment variables, all optional):
                              version check entirely               (default off)
   POP_QUIZ_AUTO_UPDATE       set to any value to AUTO-APPLY a newer version on
                              the daily check (else just nudge)    (default off)
+  POP_QUIZ_CHANNEL           "release" tracks the latest TAGGED release (safe:
+                             an un-released commit on main can never auto-apply
+                             itself); "branch" tracks POP_QUIZ_BRANCH's tip
+                             (bleeding edge)                  (default release)
 
 Updates: once a day (on UserPromptSubmit) the hook quietly checks GitHub for a
 newer __version__. By default it appends a one-line upgrade nudge; with
@@ -82,6 +91,12 @@ Robustness: harness-injected prompts (background/terminal task completions,
 as a quiz answer and silently eat a pending check. Runs without fcntl too
 (degraded, lock-free) so native Windows no longer fails silently.
 
+Fails LOUDLY, eventually: the wired hook command ends in "2>/dev/null || true"
+so a crash can never break the user's turn, which also means a crash is
+invisible. Every unexpected exception is therefore appended to
+<claude-dir>/state/pop_quiz_errors.log and surfaced by "status" and "doctor".
+If the quiz ever seems to have stopped firing, run "doctor" first.
+
 License: MIT.
 """
 
@@ -98,12 +113,16 @@ try:
 except ImportError:
     fcntl = None  # Degraded mode: best-effort, no advisory lock (see _exclusive_lock).
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # e.g. ~/.claude
 STATE_DIR = os.path.join(BASE, "state")
 STATE_FILE = os.path.join(STATE_DIR, "pop_quiz_state.json")
 LOCK_FILE = STATE_FILE + ".lock"
+# Where swallowed tracebacks go. The wired command discards stderr, so without
+# this a crash is completely silent (see the module docstring).
+ERROR_LOG = os.path.join(STATE_DIR, "pop_quiz_errors.log")
+ERROR_LOG_MAX = 64 * 1024  # keep only the newest 64 KiB of tracebacks
 PRUNE_AFTER = 30 * 24 * 3600  # forget sessions untouched for 30 days
 GLOBAL_KEY = "_global"  # holds the cross-chat defer counter + lock flag
 UPDATE_INTERVAL = 24 * 3600  # check GitHub for a newer version at most once/day
@@ -151,18 +170,71 @@ _DEFER_WORDS = {
     "skip the quiz",
 }
 
-# Messages that start with these words are work instructions or new questions,
-# not quiz answers, even if they happen to be long or contain periods. Includes
-# the interrogatives (who/what/which/...) so "who is the founder of git" is read
-# as a question, not graded as an answer.
+# A message that is NOTHING BUT an acknowledgement is not an attempt. The same
+# word followed by real content ("Yes, the lock is advisory only") IS an answer,
+# which is why this matches the WHOLE message rather than just its first word.
+_BARE_ACK = {
+    "yes",
+    "yeah",
+    "yep",
+    "yup",
+    "no",
+    "nope",
+    "nah",
+    "ok",
+    "okay",
+    "k",
+    "sure",
+    "alright",
+    "right",
+    "great",
+    "nice",
+    "cool",
+    "thanks",
+    "thank you",
+    "ty",
+    "got it",
+    "understood",
+    "fine",
+    "hmm",
+    "hm",
+    "idk",
+    "dunno",
+    "no idea",
+}
+
+# Messages that OPEN like a new work instruction rather than an answer.
+#
+# Deliberately NARROW, and it is worth knowing why. The costs here are wildly
+# asymmetric: a false DEFER increments the global counter and can freeze every
+# chat as a punishment for answering correctly, while a false ANSWER merely
+# spends one graded reply. So any opener that is also a natural way to begin an
+# answer is NOT listed. That rules out "so", "this", "that's", "these", "it",
+# "yes/no", "also", "and", "but", "actually", "sounds", "seems", and the bare
+# modals ("is", "are", "do", "can", "will"): every one of those used to classify
+# a real essay answer as a skip. It also rules out bare tool and subject names
+# ("git", "docker", "npm", "ls") since "Docker gives each container its own
+# namespace" is an answer, not an instruction.
 _ACTION_START = re.compile(
-    r"^(run|let'?s|let me|okay|ok|can you|could you|please|go ahead|now|next|"
-    r"start|begin|continue|add|create|update|fix|make|change|refactor|"
-    r"write|build|deploy|install|remove|delete|check|show|tell|explain|"
-    r"what|how|why|when|where|who|whom|whose|which|is|are|was|were|do|does|"
-    r"did|can|could|should|would|will|yes|no|yep|nope|sure|alright|great|"
-    r"thanks|thank|i want|i need|i'?d like|also|and|but|so|actually|hmm|hm|"
-    r"sounds|looks|seems|that'?s|this|those|these)\b",
+    r"^(run|re-?run|exec|execute|let'?s|let me|can you|could you|would you|"
+    r"will you|please|go ahead|carry on|keep going|continue|resume|proceed|"
+    r"next up|moving on|add|create|update|fix|make|change|modify|refactor|"
+    r"rename|write|build|compile|deploy|install|uninstall|remove|delete|drop|"
+    r"commit|push|merge|rebase|revert|checkout|check|verify|test|lint|format|"
+    r"show me|tell me|give me|explain|walk me|i want|i need|i'?d like|"
+    r"skip (?:it|this|that)|hold on|wait|stop|cancel|abort|nevermind|"
+    r"never mind|forget it)\b",
+    re.IGNORECASE,
+)
+
+# Messages that OPEN like a genuine follow-up question. Kept separate from
+# _ACTION_START so the two can be tuned independently: this one exists for the
+# v0.5.1 regression where "who is the founder of git" (no question mark) was
+# graded as a quiz answer. Limited to the wh-words, because every broader modal
+# is also an answer opener.
+_QUESTION_START = re.compile(
+    r"^(what|what'?s|how|how'?s|why|when|where|who|whom|whose|which|"
+    r"is there|are there|any (?:idea|chance|thoughts))\b",
     re.IGNORECASE,
 )
 
@@ -175,8 +247,19 @@ def looks_like_mcq_answer(msg):
     return len(_MCQ_PAIR.findall(msg or "")) >= need
 
 
+def _bare_phrase(msg):
+    """The whole message reduced to a bare lowercase phrase, or "" if it has
+    real content. Used to spot one-word acknowledgements and defer words."""
+    t = (msg or "").strip().lower().strip(".!,;:…").strip()
+    return t if len(t) <= 24 else ""
+
+
 def is_explicit_defer(msg):
-    return (msg or "").strip().lower().rstrip(".!").strip() in _DEFER_WORDS
+    return _bare_phrase(msg) in _DEFER_WORDS
+
+
+def is_bare_ack(msg):
+    return _bare_phrase(msg) in _BARE_ACK
 
 
 # Harness-injected prompts (background/terminal task completions, system
@@ -197,23 +280,31 @@ def classify(msg):
     """Was the user's message an answer to the pending quiz, or a defer?
 
     A quiz is already pending whenever this runs, so the bar to count as an
-    ANSWER is deliberately low: anything that is not an explicit defer word or a
-    clear new-work instruction is treated as an attempt. A concise but correct
-    reply ("it memoizes with functools.lru_cache") must NOT be punished as a
-    skip just because it is short — the old length/period heuristic did exactly
-    that and silently consumed the quiz.
+    ANSWER is deliberately low: anything that is not an explicit defer, a bare
+    acknowledgement, a question, or a clear new-work instruction is treated as
+    an attempt. Two regressions are pinned down here, both of which silently
+    consumed a quiz or charged an undeserved defer:
+
+      - a concise but correct reply ("it memoizes with functools.lru_cache")
+        must not be punished for being short (the old length/period heuristic),
+      - an essay answer that merely OPENS with a common word ("So the flock is
+        advisory...", "This script uses os.replace...", "Yes, it is advisory
+        only") must not be read as new work. See _ACTION_START on why that list
+        is narrow.
     """
     t = (msg or "").strip()
     if not t:
         return "defer"
-    if is_explicit_defer(msg):
+    if is_explicit_defer(msg) or is_bare_ack(msg):
         return "defer"
     if looks_like_mcq_answer(msg):
         return "answer"
     if t.endswith("?"):
         return "defer"  # a question is a question, not a quiz answer
+    if _QUESTION_START.match(t):
+        return "defer"  # an unpunctuated question is still a question
     if _ACTION_START.match(t):
-        return "defer"  # they moved on to new work / asked something → soft defer
+        return "defer"  # they moved on to new work → soft defer
     return "answer"
 
 
@@ -261,15 +352,71 @@ def _tools_summary(sess):
 
 # Per-question entry headers written by grade_directive, e.g.
 #   "### ✅ Q1 · HTTP cache headers"   /   "### 🟡 Q2 · Index trade-offs"
-# This is the single source of truth for both the score tally and which topics
-# the user got wrong, so the grading directive is pinned to emit this exact shape.
+# This is the single source of truth for the score tally, the spaced-repetition
+# boxes and the review drill, so it has to match what the MODEL actually writes,
+# not only what the directive asks for.
+#
+# It is deliberately TOLERANT, because being strict here failed silently and
+# expensively: the directive's template reads "<✅ correct | 🟡 partial | ❌
+# missed> Q<n>", the model overwhelmingly renders that as "### ✅ correct Q1 ·
+# topic" (emoji AND word), and the original pattern allowed no slot for that
+# word. On a real 283 KB journal it matched 22 of 185 graded questions, so
+# accuracy, adaptive difficulty, the Leitner boxes and the review drill were all
+# reading 12% of the data with nothing to indicate a problem. Hence: an optional
+# verdict word, looser separators, h2-h6, and `doctor` to report the coverage
+# so any future drift shows up as a number instead of rotting quietly.
+#
+# Separators are [ \t] rather than \s so a greedy match can never swallow the
+# newline and capture the following line as the topic title.
+_SEP = r"[ \t!.,:;*_·–—-]*"
 _Q_HEADER = re.compile(
-    r"^#{2,4}\s*([✅\U0001F7E1❌])\s*Q\d+\s*[·:\-]?\s*(.*)$",
+    r"^#{2,6}[ \t*_]*"
+    r"([✅❌\U0001F7E1⚠])️?"  # the verdict emoji
+    r"[ \t]*(?:correct(?:ly)?|right|partial(?:ly)?(?:[ \t]+correct)?|"
+    r"half(?:[ \t]+right)?|missed?|wrong|incorrect|unanswered|skipped|"
+    r"no[ \t]+answer)?"  # the optional verdict WORD
+    + _SEP
+    + r"Q[ \t]*\d+\b"  # Q<n>
+    + _SEP
+    + r"(.*)$",  # the topic title
+    re.MULTILINE | re.IGNORECASE,
+)
+# Dated section headers, e.g. "## 2026-01-15 · topic" (the 📅 is historical and
+# optional). Entries are attributed to the nearest one above them, which is what
+# gives the Leitner scheduler a clock.
+_DATE_HEADER = re.compile(
+    r"^#{2,3}[ \t*_]*(?:📅[ \t]*)?(\d{4})-(\d{2})-(\d{2})\b",
     re.MULTILINE,
 )
 _VERDICT_GOOD = "✅"  # ✅ correct
 _VERDICT_PART = "\U0001f7e1"  # 🟡 partial
 _VERDICT_MISS = "❌"  # ❌ missed
+
+
+def _norm_verdict(raw):
+    """Fold a matched verdict emoji onto one of the three canonical ones. The
+    model occasionally invents a fourth (⚠️ unanswered); anything that is not a
+    pass or a partial counts as missed."""
+    ch = (raw or "").replace("️", "")[:1]
+    if ch == _VERDICT_GOOD:
+        return _VERDICT_GOOD
+    if ch == _VERDICT_PART:
+        return _VERDICT_PART
+    return _VERDICT_MISS
+
+
+def _topic_key(title):
+    """Normalise a topic title into a stable spaced-repetition key.
+
+    The box history is keyed on this, so near-identical titles MUST collapse or
+    a topic can never be promoted. A real journal logged the same question as
+    "`localhost` inside a reverse-proxy container" and "localhost inside a
+    reverse-proxy container"; .strip("`") only trimmed the ends, the keys
+    differed, and a correct second answer opened a brand-new box instead of
+    promoting the old one.
+    """
+    t = re.sub(r"[`*_\"'()\[\]]", "", (title or "").lower())
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", t).split())
 
 
 def _read_journal(max_bytes=0):
@@ -284,7 +431,7 @@ def _journal_accuracy():
     """Tally graded verdicts across the whole journal. None if nothing graded."""
     counts = {_VERDICT_GOOD: 0, _VERDICT_PART: 0, _VERDICT_MISS: 0}
     for m in _Q_HEADER.finditer(_read_journal()):
-        counts[m.group(1)] += 1
+        counts[_norm_verdict(m.group(1))] += 1
     total = sum(counts.values())
     if not total:
         return None
@@ -304,13 +451,49 @@ _ANSWER_LINE = re.compile(r"\*\*Answer:\*\*\s*(.+)")
 SRS_DUE = 1
 SRS_MASTERED = 3
 SRS_BOX_MAX = 4
+# Days before a topic in each box falls due again. Without this a box is a
+# one-way ratchet: answer something right twice and it retires permanently, so
+# "mastered" quietly means "never asked again" rather than "known". Index is the
+# box number; anything at or below SRS_DUE is due immediately.
+SRS_INTERVALS = (0, 0, 7, 21, 60)
+
+
+def _today_ord():
+    import datetime
+
+    return datetime.date.today().toordinal()
+
+
+def _date_ord(y, m, d):
+    import datetime
+
+    try:
+        return datetime.date(int(y), int(m), int(d)).toordinal()
+    except ValueError:
+        return None
 
 
 def _journal_entries(text=None):
     """Parse the journal into per-question dicts, NEWEST FIRST. Each is
-    {verdict, title, question, answer}. The block between two ### headers holds
-    the quoted question and the **Answer:** bullet."""
+    {verdict, title, key, date, question, answer}. The block between two ###
+    headers holds the quoted question and the **Answer:** bullet, and `date` is
+    the dated section the entry sits under (an ordinal, or None)."""
     text = _read_journal() if text is None else text
+    # Section dates in document order, so each question can binary-search the
+    # nearest header above it.
+    sections = []
+    for d in _DATE_HEADER.finditer(text):
+        ordinal = _date_ord(d.group(1), d.group(2), d.group(3))
+        if ordinal:
+            sections.append((d.start(), ordinal))
+    starts = [s[0] for s in sections]
+
+    def _date_for(pos):
+        import bisect
+
+        i = bisect.bisect_right(starts, pos) - 1
+        return sections[i][1] if i >= 0 else None
+
     matches = list(_Q_HEADER.finditer(text))
     entries = []
     for i, m in enumerate(matches):
@@ -323,10 +506,18 @@ def _journal_entries(text=None):
             if ln.lstrip().startswith(">")
         ).strip()
         am = _ANSWER_LINE.search(block)
+        title = m.group(2).strip().strip("`").strip()
+        # An odd number of backticks means one was orphaned by the strip above
+        # ("`localhost` inside ..." -> "localhost` inside ..."); drop them all so
+        # the displayed title and the vocabulary stay clean.
+        if title.count("`") % 2:
+            title = title.replace("`", "").strip()
         entries.append(
             {
-                "verdict": m.group(1),
-                "title": m.group(2).strip().strip("`").strip(),
+                "verdict": _norm_verdict(m.group(1)),
+                "title": title,
+                "key": _topic_key(title),
+                "date": _date_for(m.start()),
                 "question": question,
                 "answer": am.group(1).strip() if am else "",
             }
@@ -336,18 +527,28 @@ def _journal_entries(text=None):
 
 def _topic_boxes(entries=None):
     """Fold each topic's verdict history (oldest -> newest) into a Leitner box:
-    ✅ promotes (+1, capped), ❌ resets to 0, 🟡 holds. Keyed by lowercased title.
-    Returns {key: {title, box, seen, last_verdict}}."""
+    ✅ promotes (+1, capped), ❌ resets to 0, 🟡 holds. Keyed by _topic_key so
+    near-identical titles share one box.
+    Returns {key: {title, box, seen, last_verdict, last_date}}."""
     entries = _journal_entries() if entries is None else entries
     boxes = {}
     for e in reversed(entries):  # oldest first so promotions accumulate
-        title = e["title"]
-        if not title:
+        title, key = e["title"], e.get("key") or _topic_key(e["title"])
+        if not key:
             continue
         b = boxes.setdefault(
-            title.lower(), {"title": title, "box": 1, "seen": 0, "last_verdict": ""}
+            key,
+            {
+                "title": title,
+                "box": 1,
+                "seen": 0,
+                "last_verdict": "",
+                "last_date": None,
+            },
         )
         b["title"], b["seen"], b["last_verdict"] = title, b["seen"] + 1, e["verdict"]
+        if e.get("date"):
+            b["last_date"] = e["date"]
         if e["verdict"] == _VERDICT_GOOD:
             b["box"] = min(SRS_BOX_MAX, b["box"] + 1)
         elif e["verdict"] == _VERDICT_MISS:
@@ -355,19 +556,81 @@ def _topic_boxes(entries=None):
     return boxes
 
 
-def _srs_due_topics(limit=5, boxes=None):
-    """Least-mastered topics first (box <= SRS_DUE), most-seen breaking ties."""
+def _days_overdue(b, today=None):
+    """How far past its review interval a topic is. Boxes at or below SRS_DUE
+    are always due. A topic with no parseable date is treated as due, since the
+    safe failure is asking again rather than retiring something unlearned."""
+    if b["box"] <= SRS_DUE:
+        return 10**6  # always due, and sorts ahead of merely-overdue topics
+    interval = SRS_INTERVALS[min(b["box"], len(SRS_INTERVALS) - 1)]
+    if not b.get("last_date"):
+        return 0
+    return ((today or _today_ord()) - b["last_date"]) - interval
+
+
+def _srs_due_topics(limit=5, boxes=None, today=None):
+    """Topics needing review: least-mastered first (box <= SRS_DUE), then the
+    ones whose box interval has elapsed, most-seen breaking ties."""
     boxes = _topic_boxes() if boxes is None else boxes
+    today = today or _today_ord()
+    scored = [(b, _days_overdue(b, today)) for b in boxes.values()]
     due = sorted(
-        (b for b in boxes.values() if b["box"] <= SRS_DUE),
-        key=lambda b: (b["box"], -b["seen"]),
+        ((b, od) for b, od in scored if od >= 0),
+        key=lambda p: (p[0]["box"], -p[1], -p[0]["seen"]),
     )
-    return [b["title"] for b in due[:limit]]
+    return [b["title"] for b, _ in due[:limit]]
 
 
-def _mastered_topics(boxes=None):
+def _mastered_topics(boxes=None, today=None):
+    """Topics in a high box that are NOT yet due for a refresher."""
     boxes = _topic_boxes() if boxes is None else boxes
-    return [b["title"] for b in boxes.values() if b["box"] >= SRS_MASTERED]
+    today = today or _today_ord()
+    return [
+        b["title"]
+        for b in boxes.values()
+        if b["box"] >= SRS_MASTERED and _days_overdue(b, today) < 0
+    ]
+
+
+def _topic_vocabulary(limit=30, boxes=None, today=None):
+    """The existing topic titles worth offering the grader as a controlled
+    vocabulary, most reusable first.
+
+    Without this the SRS cannot function at all. quiz_directive asks the model
+    to reuse a topic title, but grade_directive is what actually WRITES the
+    headers, and it used to be handed no list of existing titles. So the grader
+    coined a fresh name for every question: a real journal held 173 topics
+    across 185 questions, only 4 of them seen more than once, which means no box
+    could ever be promoted and "mastered" was permanently 0.
+
+    Ordering matters as much as inclusion. Ranking purely by review urgency puts
+    every once-missed one-off at the top, and real journals are full of titles
+    like "Cause of the JSON parse error" that name an incident rather than a
+    concept and can never legitimately recur. Those crowd out the reusable
+    titles and, worse, model the wrong naming style. So this leads with the
+    topics the current round was told to ask about, then the ones that have
+    demonstrably recurred, then the rest by urgency.
+    """
+    boxes = _topic_boxes() if boxes is None else boxes
+    today = today or _today_ord()
+    asked_now = _srs_due_topics(limit=8, boxes=boxes, today=today)
+    repeated = sorted(
+        (b for b in boxes.values() if b["seen"] > 1),
+        key=lambda b: (-b["seen"], b["box"]),
+    )
+    rest = sorted(
+        boxes.values(), key=lambda b: (-_days_overdue(b, today), b["box"], -b["seen"])
+    )
+
+    out, seen = [], set()
+    for title in asked_now + [b["title"] for b in repeated + rest]:
+        key = _topic_key(title)
+        if title and key not in seen:
+            seen.add(key)
+            out.append(title)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def _current_streak(entries=None):
@@ -464,8 +727,10 @@ def quiz_directive(count, defers, sess):
     if due:
         srs_hint = (
             f"Spaced repetition (Leitner): the user is weakest on {', '.join(due)} "
-            "— work AT LEAST ONE of these in, reusing the SAME short topic title as "
-            "before so progress tracks, but rephrasing the question. "
+            "— work AT LEAST ONE of these in, rephrasing the question but reusing "
+            "that topic title EXACTLY, character for character, when you later "
+            "journal it: the title is the key the user's history is stored under, "
+            "so rewording it resets their progress on that topic. "
         )
     if mastered:
         srs_hint += (
@@ -502,16 +767,39 @@ def quiz_directive(count, defers, sess):
     )
 
 
-def grade_directive(unlocked, seconds):
+def grade_directive(unlocked, seconds, vocab=None):
     took = f"They answered in about {seconds}s. " if seconds is not None else ""
     unlock_note = "Tool use is now UNLOCKED. " if unlocked else ""
     trim_note = ""
     if JOURNAL_MAX:
         trim_note = (
             f"After appending, trim the journal so it contains at most "
-            f"{JOURNAL_MAX} dated sections (## 📅 ... headers), removing the "
-            "oldest ones from the bottom. Update the summary table at the top "
-            "to match. "
+            f"{JOURNAL_MAX} dated sections (the '## <date> · <topic>' headers), "
+            "removing the oldest ones from the bottom. Update the summary table "
+            "at the top to match. "
+        )
+    # The controlled vocabulary. Topic titles are the PRIMARY KEY of the spaced-
+    # repetition system, so a title that drifts by one word opens a new box and
+    # loses the history. See _topic_vocabulary.
+    vocab = _topic_vocabulary() if vocab is None else vocab
+    vocab_note = ""
+    if vocab:
+        vocab_note = (
+            "TOPIC TITLES ARE A CONTROLLED VOCABULARY. These titles are already "
+            "tracked in the journal: "
+            + "; ".join(vocab)
+            + ". If a question covers one of them, reuse that title EXACTLY, "
+            "character for character, even if you would phrase it differently "
+            "— it is the key the spaced-repetition boxes are stored under, so a "
+            "reworded title silently loses the user's whole history on that "
+            "topic and resets their progress. Coin a new title ONLY for a "
+            "genuinely new topic, and when you do, NAME THE CONCEPT, NOT THIS "
+            "SESSION: a title has to be reusable the next time the same idea "
+            "comes up in a different project. Good: 'Advisory file locks', "
+            "'Atomic file replacement', 'Container network namespaces'. Bad: "
+            "'Cause of the JSON parse error', 'Why osascript hung over SSH' — "
+            "those name an incident that can never recur, so the user can never "
+            "be shown to have learned them. "
         )
     return (
         f"The user just answered the pending learning check. {took}{unlock_note}"
@@ -523,10 +811,16 @@ def grade_directive(unlocked, seconds):
         "single nudge, do not wait for a reply or stall the turn. THEN append the "
         "results to the learning "
         f"journal at {JOURNAL} (create it with a short header + a summary table if "
-        "missing). Add a section dated today, NEWEST ENTRY FIRST, with a one-line "
-        "topic summary, and render EACH question in this EXACT shape so the entry "
-        "is self-contained when re-read months later:\n"
-        "  ### <✅ correct | 🟡 partial | ❌ missed> Q<n> · <short topic title>\n"
+        "missing). Add a section dated today headed exactly "
+        "'## <YYYY-MM-DD> · <one-line topic summary>', NEWEST SECTION FIRST, and "
+        "render EACH question in this EXACT shape so the entry is self-contained "
+        "when re-read months later:\n"
+        "  ### <emoji> Q<n> · <short topic title>\n"
+        "    where <emoji> is ✅ for correct, 🟡 for partial, or ❌ for missed, "
+        "written as JUST the emoji with NO word after it, then a space, then "
+        "Q<n>. Do not write '### ✅ correct Q1'; write '### ✅ Q1'. The journal "
+        "is parsed back to drive spaced repetition, and the verdict word in that "
+        "position is the single most common cause of an entry being skipped.\n"
         "  > <the FULL question text, verbatim — include any code snippet or the "
         "A-D options exactly as shown to the user>\n"
         "  - **Context:** <one line naming the file, function, command, or concept "
@@ -537,7 +831,7 @@ def grade_directive(unlocked, seconds):
         "  - 🔗 <1-2 study links>\n"
         "Record everything COMPLETELY — never cut off or abbreviate the question, "
         "the context, the user's answer, or the correct answer; for a revision log "
-        f"completeness beats brevity. {trim_note}"
+        f"completeness beats brevity. {vocab_note}{trim_note}"
         "Then resume what they were doing."
     )
 
@@ -599,6 +893,45 @@ def load():
         return {}
 
 
+# --- error logging -----------------------------------------------------------
+
+
+def _log_error(mode):
+    """Append the current traceback to ERROR_LOG, trimming it to the newest
+    ERROR_LOG_MAX bytes. Must never raise: it runs from the top-level except."""
+    import traceback
+
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        block = f"--- {stamp} v{__version__} mode={mode}\n{traceback.format_exc()}\n"
+        old = ""
+        if os.path.exists(ERROR_LOG) and os.path.getsize(ERROR_LOG) > ERROR_LOG_MAX:
+            with open(ERROR_LOG, encoding="utf-8", errors="replace") as f:
+                old = f.read()[-ERROR_LOG_MAX // 2 :]
+            with open(ERROR_LOG, "w", encoding="utf-8") as f:
+                f.write(old)
+        with open(ERROR_LOG, "a", encoding="utf-8") as f:
+            f.write(block)
+    except Exception:
+        pass
+
+
+def _last_error():
+    """(timestamp_line, traceback_first_line) of the newest logged error, or
+    None. Surfaced by status and doctor so a swallowed crash is visible."""
+    try:
+        with open(ERROR_LOG, encoding="utf-8", errors="replace") as f:
+            blocks = f.read().split("--- ")
+    except Exception:
+        return None
+    for block in reversed([b for b in blocks if b.strip()]):
+        lines = [ln for ln in block.splitlines() if ln.strip()]
+        if lines:
+            return lines[0], (lines[-1] if len(lines) > 1 else "")
+    return None
+
+
 def save(state):
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w") as f:
@@ -648,10 +981,68 @@ def _parse_version(s):
     return tuple(int(n) for n in nums[:3]) if nums else (0,)
 
 
-def _raw_url():
-    repo = os.environ.get("POP_QUIZ_REPO") or "jay739/claude-pop-quiz"
+def _repo():
+    return os.environ.get("POP_QUIZ_REPO") or "jay739/claude-pop-quiz"
+
+
+# Resolved once per process: the git ref updates are pulled from, plus a note
+# for `status`/`doctor` saying which channel actually won.
+_REF_CACHE = {}
+
+
+def _resolve_ref():
+    """Which ref to pull the hook from.
+
+    Default is the latest TAGGED RELEASE, not a branch tip. With
+    POP_QUIZ_AUTO_UPDATE set, tracking a branch means every commit merged to it
+    self-applies to every machine within 24h, so a single bad merge silently
+    disables the hook everywhere (the wired command discards stderr). A release
+    tag makes publishing an update a deliberate act.
+
+    Falls back to the branch when the repo has no releases yet, so an install
+    never gets stranded with no update path; `status` and `doctor` report which
+    channel was used so the fallback is never invisible.
+    """
+    if "ref" in _REF_CACHE:
+        return _REF_CACHE["ref"]
     branch = os.environ.get("POP_QUIZ_BRANCH") or "main"
-    return f"https://raw.githubusercontent.com/{repo}/{branch}/hooks/pop_quiz.py"
+    channel = (os.environ.get("POP_QUIZ_CHANNEL") or "release").lower()
+    ref, note = branch, f"branch {branch}"
+    if channel != "branch":
+        tag = _latest_release_tag()
+        if tag:
+            ref, note = tag, f"release {tag}"
+        else:
+            note = f"branch {branch} (no release found)"
+    _REF_CACHE["ref"], _REF_CACHE["note"] = ref, note
+    return ref
+
+
+def _ref_note():
+    _resolve_ref()
+    return _REF_CACHE.get("note", "")
+
+
+def _latest_release_tag(timeout=3):
+    """The newest release tag via the GitHub API, or None on any failure."""
+    import urllib.request
+
+    url = f"https://api.github.com/repos/{_repo()}/releases/latest"
+    try:
+        req = urllib.request.Request(
+            url, headers={"Accept": "application/vnd.github+json"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return (json.loads(r.read(65536)) or {}).get("tag_name") or None
+    except Exception:
+        return None
+
+
+def _raw_url():
+    return (
+        f"https://raw.githubusercontent.com/{_repo()}/{_resolve_ref()}"
+        "/hooks/pop_quiz.py"
+    )
 
 
 def _fetch_remote(timeout, max_bytes=0):
@@ -717,6 +1108,17 @@ def _do_update(fetch_timeout=10):
             False,
             latest,
             ("Update aborted: the downloaded file does not look like pop_quiz.py."),
+        )
+    # And it must actually COMPILE. The wired hook command swallows stderr, so a
+    # syntactically broken update would disable the quiz on every machine with
+    # no symptom other than quizzes quietly never firing again. Cheap insurance.
+    try:
+        compile(data, target, "exec")
+    except SyntaxError as e:
+        return (
+            False,
+            latest,
+            f"Update aborted: the downloaded file does not compile ({e}).",
         )
     backup = target + ".bak"
     try:
@@ -810,13 +1212,16 @@ def cmd_status():
         if os.environ.get("POP_QUIZ_NO_UPDATE_CHECK")
         else _remote_version(timeout=3)
     ) or g.get("update_latest")
+    channel = (
+        f" [{_ref_note()}]" if not os.environ.get("POP_QUIZ_NO_UPDATE_CHECK") else ""
+    )
     if latest and _parse_version(latest) > _parse_version(__version__):
         print(
-            f"Update     : v{latest} available — run "
+            f"Update     : v{latest} available{channel} — run "
             f"`python3 {os.path.abspath(__file__)} update`"
         )
     elif latest:
-        print(f"Update     : up to date (latest v{latest})")
+        print(f"Update     : up to date (latest v{latest}){channel}")
     else:
         print("Update     : check skipped/unavailable")
     stats = g.get("stats", {})
@@ -842,6 +1247,9 @@ def cmd_status():
             f"{mastered} mastered · streak {_current_streak()} ✅   "
             "(see `review`)"
         )
+    err = _last_error()
+    if err:
+        print(f"Last error : {err[0]} — see {ERROR_LOG} (run `doctor`)")
     sessions = {
         k: v for k, v in state.items() if k != GLOBAL_KEY and isinstance(v, dict)
     }
@@ -862,6 +1270,242 @@ def cmd_status():
         print("\nNo active sessions.")
 
 
+# --- doctor command ----------------------------------------------------------
+
+# Any heading carrying a verdict emoji. Deliberately looser than _Q_HEADER so
+# doctor can report the DIFFERENCE between the two: headings that are obviously
+# graded questions but that the strict parser rejects. That number is the one
+# that would have caught this project's worst bug on day one.
+_LOOSE_Q_HEADER = re.compile(
+    r"^#{2,6}[^\n]*?[✅❌\U0001F7E1⚠][^\n]*$",
+    re.MULTILINE,
+)
+# One graded question writes exactly one of each of these bullets, so counting
+# them is a parser-independent ground truth for "how many records does this
+# journal hold" — which is what makes a coverage percentage possible at all.
+_ANSWER_BULLET = re.compile(r"^\s*[-*]\s*\*\*Answer:\*\*", re.MULTILINE)
+_SAID_BULLET = re.compile(r"^\s*[-*]\s*\*\*You said:\*\*", re.MULTILINE)
+
+
+def _wired_hooks():
+    """Every pop-quiz hook command found in <claude-dir>/settings.json, as
+    {event: [command, ...]}. Empty when there is no settings file to read."""
+    found = {}
+    for name in ("settings.json", "settings.local.json"):
+        path = os.path.join(BASE, name)
+        try:
+            with open(path, encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            continue
+        for event, groups in (cfg.get("hooks") or {}).items():
+            for group in groups or []:
+                for h in (group or {}).get("hooks", []):
+                    cmd = (h or {}).get("command", "")
+                    if (
+                        "pop_quiz" in cmd
+                        or "grill_reminder" in cmd
+                        or "POP_QUIZ_" in cmd
+                    ):
+                        found.setdefault(event, []).append(cmd)
+    return found
+
+
+def _wired_env(var, wired=None):
+    """Read a POP_QUIZ_* value out of the wired hook command.
+
+    Config is baked into the command in settings.json, not exported into the
+    shell, so a bare `doctor` would otherwise inspect the DEFAULT journal while
+    the hook is busy writing somewhere else entirely, and report 0 records on a
+    perfectly healthy install.
+    """
+    wired = _wired_hooks() if wired is None else wired
+    pattern = re.compile(r"\b" + re.escape(var) + r'=("[^"]*"|\S+)')
+    for cmds in wired.values():
+        for cmd in cmds:
+            m = pattern.search(cmd)
+            if m:
+                return m.group(1).strip('"')
+    return ""
+
+
+def cmd_doctor():
+    """Self-check. Prints what is healthy, what is broken, and exits non-zero if
+    anything needs attention, so it can run from CI or a cron.
+
+    This exists because every failure in this hook is silent by construction:
+    the wired command ends in "2>/dev/null || true", the journal is written by a
+    cooperative model rather than by code, and the parse that drives spaced
+    repetition can degrade to near-zero coverage without a single symptom. It
+    did exactly that for 37 sessions. Every check below is a thing that failed
+    quietly and should have been a number on a screen.
+    """
+    problems, warnings = [], []
+    print("=== pop-quiz doctor ===")
+    print(f"Version    : {__version__}")
+    print(f"Script     : {os.path.abspath(__file__)}")
+
+    # Report on the journal the HOOK uses, not the one this shell happens to
+    # point at. Env wins when set explicitly; otherwise take what is baked into
+    # the wired command.
+    wired = _wired_hooks()
+    global JOURNAL
+    journal_was = JOURNAL
+    from_wiring = ""
+    if not os.environ.get("POP_QUIZ_JOURNAL"):
+        from_wiring = _wired_env("POP_QUIZ_JOURNAL", wired)
+        if from_wiring:
+            JOURNAL = os.path.expanduser(os.path.expandvars(from_wiring))
+    try:
+        return _doctor_report(problems, warnings, wired, bool(from_wiring))
+    finally:
+        JOURNAL = journal_was
+
+
+def _doctor_report(problems, warnings, wired, from_wiring):
+    # --- journal parse coverage ---
+    text = _read_journal()
+    print(f"\nJournal    : {JOURNAL}")
+    if from_wiring:
+        print("  (as configured in the wired hook command)")
+    if not text:
+        warnings.append(
+            "The journal is empty or unreadable, so there is no history to "
+            "learn from yet. Normal on a fresh install."
+        )
+        print("  (empty or unreadable)")
+    else:
+        records = max(
+            len(_ANSWER_BULLET.findall(text)), len(_SAID_BULLET.findall(text))
+        )
+        entries = _journal_entries(text)
+        strict_spans = {m.start() for m in _Q_HEADER.finditer(text)}
+        unparsed = [
+            m.group(0).strip()
+            for m in _LOOSE_Q_HEADER.finditer(text)
+            if m.start() not in strict_spans
+        ]
+        dated = len(_DATE_HEADER.findall(text))
+        size_kb = len(text) // 1024
+        print(f"  size            : {size_kb} KiB · {dated} dated sections")
+        print(f"  graded records  : {records} (counted from the entry bullets)")
+        print(f"  parsed by hook  : {len(entries)}")
+        if records:
+            pct = round(100 * len(entries) / records)
+            print(f"  COVERAGE        : {pct}%")
+            if pct < 95:
+                problems.append(
+                    f"Only {pct}% of the journal parses ({len(entries)} of "
+                    f"{records} records). Everything downstream — accuracy, "
+                    "adaptive difficulty, the Leitner boxes, the review drill — "
+                    "is reading that fraction of your history. The usual cause "
+                    "is the grader drifting off the '### <emoji> Q<n> · <title>' "
+                    "header shape."
+                )
+        if unparsed:
+            print(f"  UNRECOGNISED    : {len(unparsed)} heading(s), e.g.")
+            for h in unparsed[:3]:
+                print(f"      {h[:88]}")
+            problems.append(
+                f"{len(unparsed)} heading(s) carry a verdict emoji but do not "
+                "match the question-header shape, so those questions are "
+                "invisible to the scheduler."
+            )
+        if entries and not any(e.get("date") for e in entries):
+            warnings.append(
+                "No entry could be dated (no '## YYYY-MM-DD' section headers), "
+                "so review intervals fall back to 'always due' and no topic can "
+                "rest."
+            )
+
+    # --- scheduler health ---
+    boxes = _topic_boxes()
+    if boxes:
+        repeated = sum(1 for b in boxes.values() if b["seen"] > 1)
+        acc = _journal_accuracy()
+        print(f"\nScheduler  : {len(boxes)} topics tracked")
+        print(
+            f"  repeated        : {repeated} seen more than once "
+            f"({round(100 * repeated / len(boxes))}%)"
+        )
+        print(
+            f"  due            : {len(_srs_due_topics(limit=10**6, boxes=boxes))}"
+            f" · mastered: {len(_mastered_topics(boxes))}"
+            f" · streak: {_current_streak()} ✅"
+        )
+        if acc:
+            print(f"  accuracy        : {acc['pct']}% over {acc['total']} questions")
+        # Measured over RECENT entries, not the whole journal: a history written
+        # before the controlled vocabulary existed will always show a low
+        # lifetime repeat ratio, and a check that can never go green is a check
+        # people learn to ignore. What matters is whether the grader is reusing
+        # titles NOW, so count recent questions whose topic already existed.
+        recent = _journal_entries()[:40]
+        earlier = {e["key"] for e in _journal_entries()[len(recent) :]}
+        reused = sum(1 for e in recent if e["key"] in earlier)
+        if len(recent) >= 20 and earlier:
+            print(f"  title reuse     : {reused} of the last {len(recent)} questions")
+            if reused == 0:
+                problems.append(
+                    f"None of the last {len(recent)} questions reused an "
+                    "existing topic title, so no Leitner box can ever be "
+                    "promoted and nothing is ever mastered. The grader is "
+                    "coining a new title per question instead of reusing the "
+                    "controlled vocabulary it is given."
+                )
+
+    # --- wiring ---
+    print("\nWiring     :", f"{sum(len(v) for v in wired.values())} hook command(s)")
+    mine = os.path.basename(os.path.abspath(__file__))
+    for event in ("UserPromptSubmit", "PreToolUse"):
+        cmds = wired.get(event, [])
+        print(f"  {event:<18}: {len(cmds)}")
+        if len(cmds) > 1:
+            problems.append(
+                f"{len(cmds)} pop-quiz hooks are wired to {event}. They all "
+                "run, so the action counter increments once per hook and quizzes "
+                "fire early. Remove the duplicates from settings.json."
+            )
+        for cmd in cmds:
+            if mine not in cmd and "pop_quiz" not in cmd:
+                warnings.append(
+                    f"The {event} hook runs a differently-named script than this "
+                    f"one ({mine}). That is supported, but make sure you are "
+                    "running doctor against the script that is actually wired."
+                )
+    if not wired:
+        if os.path.isdir(os.path.join(BASE, ".git")):
+            print("  (running from a git checkout, not an install — nothing to wire)")
+        else:
+            warnings.append(
+                "No pop-quiz hook found in settings.json, so nothing is firing. "
+                "Run install.sh, then /hooks in Claude Code."
+            )
+
+    # --- update channel + swallowed errors ---
+    print(f"\nUpdates    : channel {_ref_note() or 'unknown'}")
+    err = _last_error()
+    if err:
+        print(f"Last error : {err[0]}\n             {err[1][:100]}")
+        problems.append(
+            f"A crash was logged ({err[0]}). The wired command discards stderr, "
+            f"so this never surfaced. Full tracebacks: {ERROR_LOG}"
+        )
+    else:
+        print("Last error : none logged")
+
+    print()
+    for p in problems:
+        print(f"PROBLEM: {p}\n")
+    for w in warnings:
+        print(f"note: {w}\n")
+    if problems:
+        print(f"{len(problems)} problem(s) found.")
+        return 1
+    print("All checks passed." + (f" {len(warnings)} note(s)." if warnings else ""))
+    return 0
+
+
 # --- review command ----------------------------------------------------------
 
 
@@ -870,10 +1514,10 @@ def cmd_review(n=None):
     Pure read of the journal — no model, no network. `n` caps how many topics."""
     entries = _journal_entries()
     boxes = _topic_boxes(entries)
-    due_keys = {t.lower() for t in _srs_due_topics(limit=10**6, boxes=boxes)}
+    due_keys = {_topic_key(t) for t in _srs_due_topics(limit=10**6, boxes=boxes)}
     drill, seen = [], set()
     for e in entries:  # newest first → most recent phrasing per topic
-        key = e["title"].lower()
+        key = e.get("key") or _topic_key(e["title"])
         if key in due_keys and key not in seen and e["question"]:
             seen.add(key)
             drill.append(e)
@@ -888,7 +1532,7 @@ def cmd_review(n=None):
     print(f"=== pop-quiz review · {len(drill)} topic(s) due ===")
     print("Cover the A: line, recall it, then check.\n")
     for i, e in enumerate(drill, 1):
-        box = boxes.get(e["title"].lower(), {}).get("box", 0)
+        box = boxes.get(e.get("key") or _topic_key(e["title"]), {}).get("box", 0)
         print(f"{i}. {e['title']}  (box {box}, last verdict {e['verdict']})")
         print(f"   Q: {e['question']}")
         print(f"   A: {e['answer'] or '(no answer recorded in the journal)'}\n")
@@ -909,6 +1553,8 @@ def main():
     if mode == "review":
         cmd_review(sys.argv[2] if len(sys.argv) > 2 else None)
         return
+    if mode in ("doctor", "check", "selfcheck"):
+        sys.exit(cmd_doctor())
 
     payload = {}
     try:
@@ -1077,4 +1723,14 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:
+        # The wired hook command ends in "2>/dev/null || true", so an unhandled
+        # exception here would vanish without a trace and the quiz would simply
+        # stop firing. Record it where `status` and `doctor` can find it, then
+        # exit cleanly so the user's turn is never broken by this hook.
+        _log_error(sys.argv[1] if len(sys.argv) > 1 else "prompt")
+        sys.exit(0)
